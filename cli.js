@@ -41,6 +41,9 @@ QUESTIONS
 
 OPTIONS
   --model <name>              default jev-latest
+  --api-key <key>             overrides TYPESAFE_API_KEY (which is read from .env
+                              in the CURRENT directory, so pass this when running
+                              the CLI from somewhere else)
   --json                      print the raw JSON result
   --no-cache                  skip the response cache
   --quiet                     suppress the usage footer
@@ -73,6 +76,7 @@ function parseArgs(argv) {
 		else if (a === '--file') out.file = argv[++i];
 		else if (a === '--questions') out.questionsFile = argv[++i];
 		else if (a === '--model') out.model = argv[++i];
+		else if (a === '--api-key') out.apiKey = argv[++i];
 		else if (a === '--noul') out.noul.push(argv[++i]);
 		else if (a === '--choice') out.choice.push(argv[++i]);
 		else if (a === '--score') out.score.push(argv[++i]);
@@ -185,7 +189,7 @@ async function main() {
 	}
 
 	if (command === 'models') {
-		const models = await listModels();
+		const models = await listModels({ apiKey: args.apiKey });
 		for (const m of models) {
 			console.log(`${m.name.padEnd(14)} ${String(m.release_date).slice(0, 10)}  ${m.description}`);
 		}
@@ -218,6 +222,7 @@ async function main() {
 
 	const jev = new BaseJev({
 		modelName: args.model,
+		apiKey: args.apiKey,
 		cache: !args.noCache,
 		logLevel: 'warn'
 	});
