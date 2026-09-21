@@ -1,0 +1,13 @@
+node_modules
+.DS_Store
+logs/*
+!logs/.gitkeep
+tmp/*
+!tmp/.gitkeep
+.env
+.env.local
+env.yaml
+coverage/*
+!coverage/.gitkeep
+scratch*
+.jev-cache/

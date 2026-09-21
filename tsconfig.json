@@ -1,0 +1,58 @@
+{
+	"compilerOptions": {
+		"checkJs": true,
+		"allowJs": true,
+		"declaration": true,
+		"emitDeclarationOnly": true,
+		"maxNodeModuleJsDepth": 0,
+		"target": "ESNext",
+		"module": "ESNext",
+		"moduleResolution": "Node",
+		"strict": false,
+		"noImplicitAny": false,
+		"strictNullChecks": false,
+		"allowUnreachableCode": false,
+		"allowSyntheticDefaultImports": true,
+		"resolveJsonModule": true,
+		"skipLibCheck": true,
+		"noEmitOnError": false,
+		"baseUrl": ".",
+		"paths": {
+			"*": ["*", "src/*"]
+		}
+	},
+	"exclude": [
+		"node_modules",
+		"dist",
+		"build",
+		"coverage",
+		"tests/**/*",
+		"scripts/**/*",
+		"examples/**/*",
+		"**/*.test.js"
+	],
+	"include": [
+		"index.js",
+		"base.js",
+		"client.js",
+		"errors.js",
+		"models.js",
+		"tokens.js",
+		"questions.js",
+		"answers.js",
+		"cache.js",
+		"governor.js",
+		"logger.js",
+		"evaluator.js",
+		"classifier.js",
+		"detector.js",
+		"scorer.js",
+		"router.js",
+		"ranker.js",
+		"extractor.js",
+		"taxonomy.js",
+		"guard.js",
+		"cli.js",
+		"types.d.ts"
+	]
+}
