@@ -6,8 +6,8 @@
 	"main": "index.js",
 	"files": [
 		".env.example",
+		"AGENTS.md",
 		"CHANGELOG.md",
-		"GUIDE.md",
 		"LICENSE",
 		"RECIPES.md",
 		"answers.js",

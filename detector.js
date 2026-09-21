@@ -11,6 +11,7 @@
 
 import BaseJev from './base.js';
 import { noul } from './questions.js';
+import { requireAnswers } from './answers.js';
 import { JevValidationError } from './errors.js';
 import log from './logger.js';
 
@@ -115,6 +116,9 @@ class Detector extends BaseJev {
 	 * @returns {Detection}
 	 */
 	_shape(result) {
+		// A dropped condition would read as "not triggered". Stop instead.
+		requireAnswers(result.answers, this.conditionIds, 'Detector');
+
 		/** @type {Object.<string, boolean>} */
 		const flags = {};
 		/** @type {Object.<string, number>} */
@@ -128,7 +132,6 @@ class Detector extends BaseJev {
 
 		for (const id of this.conditionIds) {
 			const answer = result.answers[id];
-			if (!answer) continue;
 			const t = this.conditionThresholds[id];
 			const p = answer.noul;
 

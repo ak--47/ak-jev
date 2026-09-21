@@ -266,6 +266,7 @@ __export(index_exports, {
   enrichAnswer: () => enrichAnswer,
   enrichAnswers: () => enrichAnswers,
   errorFromResponse: () => errorFromResponse,
+  estimate: () => estimate,
   estimateQuestionTokens: () => estimateQuestionTokens,
   estimateRequest: () => estimateRequest,
   estimateTokens: () => estimateTokens,
@@ -796,8 +797,7 @@ var ResponseCache = class {
       this.misses++;
       return void 0;
     }
-    this._map.delete(key);
-    this._map.set(key, entry);
+    this._remember(key, entry);
     this.hits++;
     return entry.value;
   }
@@ -806,13 +806,28 @@ var ResponseCache = class {
    * @param {any} value
    */
   set(key, value) {
-    this._map.set(key, { at: Date.now(), value });
+    this._remember(key, { at: Date.now(), value });
+    if (this.dir) this._writeDisk(key, value);
+  }
+  /**
+   * Put an entry in the map and evict down to `max`.
+   *
+   * Every write goes through here, including the ones that come back off disk.
+   * A disk read that wrote straight to the map would let a long run over a large
+   * corpus grow memory without bound, which is exactly the run a disk cache is
+   * for.
+   *
+   * @param {string} key
+   * @param {{at: number, value: any}} entry
+   */
+  _remember(key, entry) {
+    this._map.delete(key);
+    this._map.set(key, entry);
     while (this._map.size > this.max) {
       const oldest = this._map.keys().next().value;
       if (oldest === void 0) break;
       this._map.delete(oldest);
     }
-    if (this.dir) this._writeDisk(key, value);
   }
   clear() {
     this._map.clear();
@@ -828,7 +843,7 @@ var ResponseCache = class {
     try {
       const parsed = JSON.parse((0, import_node_fs.readFileSync)(path, "utf8"));
       const entry = { at: parsed.at ?? Date.now(), value: parsed.value };
-      this._map.set(key, entry);
+      this._remember(key, entry);
       return entry;
     } catch {
       return void 0;
@@ -851,6 +866,7 @@ function resolveCache(option = false) {
 }
 
 // answers.js
+init_errors();
 var DEFAULT_THRESHOLDS = Object.freeze({
   /** `answer.yes` is true at or above this. */
   yes: 0.5,
@@ -950,6 +966,14 @@ function enrichAnswers(answers, opts = {}) {
     });
   }
   return out;
+}
+function requireAnswers(answers, ids, className) {
+  const missing = ids.filter((id) => !answers?.[id]);
+  if (missing.length === 0) return;
+  throw new JevValidationError(
+    `${className}: the API returned no answer for ${missing.map((m) => `"${m}"`).join(", ")}. Expected ${ids.length} answers, got ${Object.keys(answers ?? {}).length}. A question id passed through opts.questions may have collided with one of the class's own ids.`,
+    { questionId: missing[0] }
+  );
 }
 function rank(probabilities) {
   return Object.entries(probabilities ?? {}).map(([label, probability]) => ({ label, probability: numberOr(probability, 0) })).sort((a, b) => b.probability - a.probability || a.label.localeCompare(b.label));
@@ -1406,14 +1430,15 @@ var BaseJev = class {
    * if (s.summary.refund.agreement < 0.9) sendToHuman(ticket);
    */
   async sample(state, questions, opts = {}) {
-    const n = Math.max(1, Math.floor(opts.n ?? 5));
+    const { n: requested, ...evaluateOpts } = opts;
+    const n = Math.max(1, Math.floor(requested ?? 5));
     const draws = await Promise.all(
       Array.from(
         { length: n },
         () => (
           // `cache: false` is not enough here — the instance may have one. Pass a
           // per-call marker that `evaluate()` honours.
-          this.evaluate(state, questions, { ...opts, _bypassCache: true })
+          this.evaluate(state, questions, { ...evaluateOpts, _bypassCache: true })
         )
       )
     );
@@ -1543,11 +1568,11 @@ var BaseJev = class {
       if (m.levelNames) meta[id] = m;
     }
     const wire = toWireQuestions(expanded);
-    const estimate = estimateRequest({ state, questions: wire, model });
-    if (this.checkBudget && !estimate.withinBudget) {
-      for (const w of estimate.warnings) logger_default.warn(`ak-jev: ${w}`);
+    const estimate2 = estimateRequest({ state, questions: wire, model });
+    if (this.checkBudget && !estimate2.withinBudget) {
+      for (const w of estimate2.warnings) logger_default.warn(`ak-jev: ${w}`);
     }
-    return { expanded, wire, meta, estimate };
+    return { expanded, wire, meta, estimate: estimate2 };
   }
   /**
    * Turn a raw API body into the enriched result, and fold its usage into the
@@ -1894,6 +1919,7 @@ var Classifier = class extends base_default {
    * @returns {Classification}
    */
   _shape(result) {
+    requireAnswers(result.answers, [this.questionId], "Classifier");
     const answer = result.answers[this.questionId];
     const decided = answer.confidence >= this.minConfidence;
     const alternatives = answer.ranked.filter((r) => r.label !== answer.choice && r.probability >= this.alternativeThreshold).filter((r) => r.probability > 0);
@@ -1996,6 +2022,7 @@ var Detector = class extends base_default {
    * @returns {Detection}
    */
   _shape(result) {
+    requireAnswers(result.answers, this.conditionIds, "Detector");
     const flags = {};
     const probabilities = {};
     const verdicts = {};
@@ -2003,7 +2030,6 @@ var Detector = class extends base_default {
     const unsure = [];
     for (const id of this.conditionIds) {
       const answer = result.answers[id];
-      if (!answer) continue;
       const t = this.conditionThresholds[id];
       const p = answer.noul;
       probabilities[id] = p;
@@ -2184,6 +2210,7 @@ var Scorer = class extends base_default {
    * @returns {CompositeScore}
    */
   _shape(result) {
+    requireAnswers(result.answers, this.dimensionIds, "Scorer");
     const dimensions = {};
     let composite = 0;
     let confidenceSum = 0;
@@ -2193,7 +2220,6 @@ var Scorer = class extends base_default {
     ), confidence: Infinity };
     for (const id of this.dimensionIds) {
       const answer = result.answers[id];
-      if (!answer) continue;
       const normalized = this.inverted[id] ? 1 - answer.normalized : answer.normalized;
       const weight = this.normalizedWeights[id];
       const weighted = weight * normalized;
@@ -2289,6 +2315,7 @@ var Router = class extends base_default {
   async route(state, extra = void 0, opts = {}) {
     const questions = { [this.questionId]: this.question, ...this.extraQuestions };
     const result = await this.evaluate(state, questions, opts);
+    requireAnswers(result.answers, [this.questionId], "Router");
     const answer = result.answers[this.questionId];
     const name = answer.choice;
     const spec = this.routes[name];
@@ -2407,13 +2434,13 @@ var Ranker = class extends base_default {
     await Promise.all(
       batches.map(async (batch) => {
         const questions = {};
-        for (const { index, text } of batch) {
-          questions[`c${index}`] = this._questionFor(text);
+        for (const { index, question } of batch) {
+          questions[`c${index}`] = question;
         }
         const result = await this.evaluate({ query }, questions, opts);
+        requireAnswers(result.answers, Object.keys(questions), "Ranker");
         for (const { index } of batch) {
           const answer = result.answers[`c${index}`];
-          if (!answer) continue;
           rows.push({
             rank: 0,
             // assigned after the global sort
@@ -2519,7 +2546,7 @@ var Ranker = class extends base_default {
    * Split candidates into requests that each fit the token budget.
    * @param {any} query
    * @param {any[]} candidates
-   * @returns {Array<Array<{index: number, text: any}>>}
+   * @returns {Array<Array<{index: number, text: any, question: any}>>}
    */
   _batch(query, candidates) {
     const limits = this.limits();
@@ -2530,13 +2557,14 @@ var Ranker = class extends base_default {
     let used = 0;
     candidates.forEach((candidate, index) => {
       const text = this.toText(candidate, index);
-      const cost = estimateQuestionTokens(this._questionFor(text));
+      const question = this._questionFor(text);
+      const cost = estimateQuestionTokens(question);
       if (current.length > 0 && (used + cost > budget || current.length >= this.batchSize)) {
         batches.push(current);
         current = [];
         used = 0;
       }
-      current.push({ index, text });
+      current.push({ index, text, question });
       used += cost;
     });
     if (current.length > 0) batches.push(current);
@@ -2640,19 +2668,29 @@ var Extractor = class extends base_default {
    * @returns {Extraction}
    */
   _shape(result) {
+    requireAnswers(result.answers, this.fieldNames, "Extractor");
     const record = {};
     const fields = {};
     const missing = [];
     const uncertain = [];
     for (const name of this.fieldNames) {
       const answer = result.answers[name];
-      if (!answer) continue;
       const spec = this.fieldSpecs[name];
       const notStated = answer.choice === NOT_STATED;
       const confident = answer.confidence >= spec.minConfidence;
       const decided = !notStated && confident;
       let value = decided ? answer.choice : null;
-      if (decided && spec.transform) value = spec.transform(value, answer);
+      if (decided && spec.transform) {
+        try {
+          value = spec.transform(value, answer);
+        } catch (err) {
+          throw new JevValidationError(
+            `Extractor: the transform for field "${name}" threw on the value ${JSON.stringify(answer.choice)}: ${/** @type {Error} */
+            err?.message}`,
+            { questionId: name }
+          );
+        }
+      }
       record[name] = value;
       fields[name] = {
         value,
@@ -2723,6 +2761,7 @@ var Taxonomy = class extends base_default {
     let frontier = [{ path: [], node: this.tree, score: 1, steps: [] }];
     const finished = [];
     let requests = 0;
+    let truncated = false;
     for (let depth = 0; depth < maxDepth; depth++) {
       const descending = [];
       for (const entry of frontier) {
@@ -2769,6 +2808,7 @@ var Taxonomy = class extends base_default {
       next.sort((a, b) => b.score - a.score);
       frontier = next.slice(0, Math.max(1, beam));
       if (frontier.length === 0) break;
+      if (depth === maxDepth - 1 && frontier.some((e) => !isLeaf(e.node))) truncated = true;
     }
     for (const entry of frontier) finished.push(entry);
     finished.sort((a, b) => b.score - a.score);
@@ -2791,6 +2831,8 @@ var Taxonomy = class extends base_default {
       score: best.score,
       steps: best.steps,
       candidates: unique.map((f) => ({ path: f.path, score: f.score })),
+      /** True when `maxDepth` stopped the walk above a leaf. */
+      truncated,
       requests,
       usage: this.getLastUsage()
     };
@@ -2999,12 +3041,12 @@ var Guard = class extends base_default {
    * @returns {Verdict}
    */
   _shape(result) {
+    requireAnswers(result.answers, this.hazardIds, "Guard");
     const probabilities = {};
     const triggered = [];
     let strictest = 0;
     for (const id of this.hazardIds) {
       const answer = result.answers[id];
-      if (!answer) continue;
       const spec = this.hazards[id];
       const p = answer.noul;
       probabilities[id] = p;
@@ -3055,6 +3097,15 @@ async function ask(state, questions, opts = {}) {
 async function models(opts = {}) {
   return client(opts).listModels();
 }
+function estimate(state, questions, opts = {}) {
+  const model = opts.model ?? process.env.TYPESAFE_DEFAULT_MODEL ?? DEFAULT_MODEL;
+  const wire = toWireQuestions(expandQuestions(questions));
+  const est = estimateRequest({ state, questions: wire, model });
+  return {
+    ...est,
+    estimatedCost: computeCost({ inputTokens: est.totalTokens, outputTokens: 0 }, model)
+  };
+}
 async function sample(state, questions, opts = {}) {
   return client(opts).sample(state, questions, opts);
 }
@@ -3070,6 +3121,7 @@ var index_default = {
   Guard: guard_default,
   ask,
   sample,
+  estimate,
   models,
   client,
   resetClient
@@ -3133,6 +3185,7 @@ var index_default = {
   enrichAnswer,
   enrichAnswers,
   errorFromResponse,
+  estimate,
   estimateQuestionTokens,
   estimateRequest,
   estimateTokens,

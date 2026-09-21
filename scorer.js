@@ -17,6 +17,7 @@
 
 import BaseJev from './base.js';
 import { score as scoreQuestion } from './questions.js';
+import { requireAnswers } from './answers.js';
 import { JevValidationError } from './errors.js';
 import log from './logger.js';
 
@@ -198,6 +199,9 @@ class Scorer extends BaseJev {
 	 * @returns {CompositeScore}
 	 */
 	_shape(result) {
+		// A dropped dimension would silently shrink the composite. Stop instead.
+		requireAnswers(result.answers, this.dimensionIds, 'Scorer');
+
 		/** @type {Object.<string, any>} */
 		const dimensions = {};
 		let composite = 0;
@@ -206,7 +210,6 @@ class Scorer extends BaseJev {
 
 		for (const id of this.dimensionIds) {
 			const answer = result.answers[id];
-			if (!answer) continue;
 
 			// An inverted dimension counts backwards, so a high level pulls the
 			// composite down. Done here, after normalization, so it is a clean flip.

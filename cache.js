@@ -118,8 +118,7 @@ export class ResponseCache {
 			return undefined;
 		}
 		// Refresh LRU position.
-		this._map.delete(key);
-		this._map.set(key, entry);
+		this._remember(key, entry);
 		this.hits++;
 		return entry.value;
 	}
@@ -129,13 +128,29 @@ export class ResponseCache {
 	 * @param {any} value
 	 */
 	set(key, value) {
-		this._map.set(key, { at: Date.now(), value });
+		this._remember(key, { at: Date.now(), value });
+		if (this.dir) this._writeDisk(key, value);
+	}
+
+	/**
+	 * Put an entry in the map and evict down to `max`.
+	 *
+	 * Every write goes through here, including the ones that come back off disk.
+	 * A disk read that wrote straight to the map would let a long run over a large
+	 * corpus grow memory without bound, which is exactly the run a disk cache is
+	 * for.
+	 *
+	 * @param {string} key
+	 * @param {{at: number, value: any}} entry
+	 */
+	_remember(key, entry) {
+		this._map.delete(key);
+		this._map.set(key, entry);
 		while (this._map.size > this.max) {
 			const oldest = this._map.keys().next().value;
 			if (oldest === undefined) break;
 			this._map.delete(oldest);
 		}
-		if (this.dir) this._writeDisk(key, value);
 	}
 
 	clear() {
@@ -154,7 +169,7 @@ export class ResponseCache {
 		try {
 			const parsed = JSON.parse(readFileSync(path, 'utf8'));
 			const entry = { at: parsed.at ?? Date.now(), value: parsed.value };
-			this._map.set(key, entry);
+			this._remember(key, entry);
 			return entry;
 		} catch {
 			// A corrupt cache file is a cache miss, not a crash. The next write

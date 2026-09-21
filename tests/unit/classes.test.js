@@ -762,3 +762,116 @@ describe('Guard', () => {
 		expect(await safe('evil')).toBe('refused at input');
 	});
 });
+
+// ── regressions from the 0.1.0 code review ───────────────────────────────────
+
+describe('review regressions', () => {
+	/** A response that omits one of the answers the class asked for. */
+	const partial = (answers) => systemOneBody(answers);
+
+	test('Scorer refuses a composite when a dimension came back unanswered', async () => {
+		// Before the fix this returned composite 0.5 as if both dimensions had
+		// answered. A quietly halved score is worse than a loud stop.
+		const { fetch } = fakeFetch([{ body: partial({ a: scoreAnswer(2, ['x', 'y', 'z'], { 0: 0, 1: 0, 2: 1 }, 1) }) }]);
+		const s = new Scorer({
+			...OFFLINE, fetch,
+			dimensions: {
+				a: { weight: 0.5, instructions: 'a', levels: ['x', 'y', 'z'] },
+				b: { weight: 0.5, instructions: 'b', levels: ['x', 'y', 'z'] }
+			}
+		});
+		await expect(s.score('t')).rejects.toThrow(/no answer for "b"/);
+	});
+
+	test('Detector refuses when a condition came back unanswered', async () => {
+		// A dropped condition would read as "not triggered" — the unsafe direction.
+		const { fetch } = fakeFetch([{ body: partial({ a: noulAnswer(0.9) }) }]);
+		const d = new Detector({ ...OFFLINE, fetch, conditions: { a: 'a?', b: 'b?' } });
+		await expect(d.check('t')).rejects.toThrow(/no answer for "b"/);
+	});
+
+	test('Guard refuses when a hazard came back unanswered', async () => {
+		// Same, and worse: a missing hazard silently reads as "did not fire".
+		const { fetch } = fakeFetch([{ body: partial({ injection: noulAnswer(0.1) }) }]);
+		const g = new Guard({ ...OFFLINE, fetch, hazards: { injection: 'a?', secrets: 'b?' } });
+		await expect(g.inspect('t')).rejects.toThrow(/no answer for "secrets"/);
+	});
+
+	test('Extractor refuses when a field came back unanswered', async () => {
+		// A dropped field is indistinguishable from one the document did not state.
+		const { fetch } = fakeFetch([{ body: partial({ a: choiceAnswer('X', { X: 1 }, 1) }) }]);
+		const e = new Extractor({
+			...OFFLINE, fetch,
+			fields: { a: { instructions: 'a', options: ['X'] }, b: { instructions: 'b', options: ['Y'] } }
+		});
+		await expect(e.extract('t')).rejects.toThrow(/no answer for "b"/);
+	});
+
+	test('Ranker refuses when a candidate came back unanswered', async () => {
+		const { fetch } = fakeFetch([{ body: partial({ c0: noulAnswer(0.5) }) }]);
+		const r = new Ranker({ ...OFFLINE, fetch });
+		await expect(r.rank('q', ['a', 'b'])).rejects.toThrow(/no answer for "c1"/);
+	});
+
+	test('Classifier and Router give a named error, not a TypeError', async () => {
+		const { fetch: f1 } = fakeFetch([{ body: partial({ wrong_id: choiceAnswer('a', { a: 1 }, 1) }) }]);
+		const c = new Classifier({ ...OFFLINE, fetch: f1, labels: ['a', 'b'] });
+		await expect(c.classify('t')).rejects.toThrow(/no answer for "label"/);
+
+		const { fetch: f2 } = fakeFetch([{ body: partial({ wrong_id: choiceAnswer('a', { a: 1 }, 1) }) }]);
+		const r = new Router({ ...OFFLINE, fetch: f2, routes: { a: 'A', b: 'B' } });
+		await expect(r.route('t')).rejects.toThrow(/no answer for "route"/);
+	});
+
+	test('the error names the collision as a likely cause', async () => {
+		// The realistic way to hit this: opts.questions reusing a class's own id.
+		const { fetch } = fakeFetch([{ body: partial({ a: noulAnswer(0.9) }) }]);
+		const d = new Detector({ ...OFFLINE, fetch, conditions: { a: 'a?', b: 'b?' } });
+		await expect(d.check('t')).rejects.toThrow(/collided/);
+	});
+
+	test('Extractor names the field when a transform throws', async () => {
+		// Before the fix this surfaced as a bare "boom" with no context.
+		const { fetch } = fakeFetch([{ body: systemOneBody({ month: choiceAnswer('Smarch', { Smarch: 1 }, 1) }) }]);
+		const e = new Extractor({
+			...OFFLINE, fetch,
+			fields: { month: { instructions: 'm', options: ['Smarch'], transform: () => { throw new Error('boom'); } } }
+		});
+		await expect(e.extract('t')).rejects.toThrow(/transform for field "month" threw on the value "Smarch"/);
+	});
+
+	test('Ranker builds each candidate question once, not twice', async () => {
+		// _batch built a question to size it, then rank() rebuilt it to send it.
+		// Doubled JSON work on every candidate in a 1,200-candidate re-rank.
+		const { fetch } = fakeFetch(async (_u, init) => {
+			const ids = Object.keys(JSON.parse(init.body).questions);
+			return { body: systemOneBody(Object.fromEntries(ids.map((id) => [id, noulAnswer(0.5)]))) };
+		});
+		const r = new Ranker({ ...OFFLINE, fetch });
+		let built = 0;
+		const orig = r._questionFor.bind(r);
+		r._questionFor = (t) => { built++; return orig(t); };
+		await r.rank('q', ['a', 'b', 'c', 'd']);
+		expect(built).toBe(4);
+	});
+
+	test('Taxonomy reports a walk truncated by maxDepth', async () => {
+		let deep = null;
+		for (let i = 0; i < 5; i++) deep = deep ? { ['L' + i]: deep } : { leaf: null };
+		const walk = () => fakeFetch(async (_u, init) => {
+			const labels = Object.keys(JSON.parse(init.body).questions.level.criteria);
+			return {
+				body: systemOneBody({
+					level: choiceAnswer(labels[0], Object.fromEntries(labels.map((l, i) => [l, i === 0 ? 1 : 0])), 1)
+				})
+			};
+		});
+
+		const shallow = await new Taxonomy({ ...OFFLINE, fetch: walk().fetch, tree: deep }).classify('x', { maxDepth: 2 });
+		expect(shallow.truncated).toBe(true);
+		expect(shallow.path).toHaveLength(2);
+
+		const full = await new Taxonomy({ ...OFFLINE, fetch: walk().fetch, tree: deep }).classify('x', { maxDepth: 10 });
+		expect(full.truncated).toBe(false);
+	});
+});

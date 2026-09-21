@@ -13,6 +13,7 @@
 import BaseJev from './base.js';
 import { choice } from './questions.js';
 import { expandQuestions } from './questions.js';
+import { requireAnswers } from './answers.js';
 import { JevValidationError } from './errors.js';
 import log from './logger.js';
 
@@ -113,6 +114,7 @@ class Router extends BaseJev {
 		const questions = { [this.questionId]: this.question, ...this.extraQuestions };
 		const result = await this.evaluate(state, questions, opts);
 
+		requireAnswers(result.answers, [this.questionId], 'Router');
 		const answer = result.answers[this.questionId];
 		const name = answer.choice;
 		const spec = this.routes[name];

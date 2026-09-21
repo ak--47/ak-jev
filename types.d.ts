@@ -235,6 +235,12 @@ export declare function enrichAnswers(
 	opts?: { thresholds?: Thresholds; meta?: Record<string, { levelNames?: string[] }> }
 ): Record<string, Answer>;
 export declare function rank(probabilities: Record<string, number>): RankedEntry[];
+/** Throw if any question id came back without an answer. Used by every class. */
+export declare function requireAnswers(
+	answers: Record<string, unknown>,
+	ids: string[],
+	className: string
+): void;
 export declare function normalizedEntropy(values: number[]): number;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -992,6 +998,8 @@ export interface TaxonomyResult {
 	score: number;
 	steps: TaxonomyStep[];
 	candidates: Array<{ path: string[]; score: number }>;
+	/** True when `maxDepth` stopped the walk above a leaf, so `path` is partial. */
+	truncated: boolean;
 	/** API round trips this walk took. */
 	requests: number;
 	usage: Usage | null;
@@ -1237,6 +1245,16 @@ export declare function ask<Q extends Questions>(
 export declare function models(opts?: JevOptions): Promise<ModelCard[]>;
 
 /**
+ * Token and cost estimate for a request. Synchronous, free, and needs no API key.
+ * `BaseJev.estimate()` is the same calculation on a configured client.
+ */
+export declare function estimate(
+	state: EntryType,
+	questions: Questions,
+	opts?: { model?: string }
+): Estimate & { estimatedCost: number | null };
+
+/**
  * Ask the same questions `n` times and report the spread. Bypasses the cache.
  *
  * Jev is consistent but not deterministic: 12 identical requests, measured
@@ -1270,6 +1288,7 @@ declare const _default: {
 	Guard: typeof Guard;
 	ask: typeof ask;
 	sample: typeof sample;
+	estimate: typeof estimate;
 	models: typeof models;
 	client: typeof client;
 	resetClient: typeof resetClient;

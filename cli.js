@@ -14,6 +14,7 @@ import { readFileSync } from 'node:fs';
 import BaseJev from './base.js';
 import { noul, choice, score } from './questions.js';
 import { listModels, MODEL_PRICING, MODEL_PRICING_AS_OF, MODEL_LIMITS } from './models.js';
+import { estimate as estimateRequestCost } from './index.js';
 import { JevError } from './errors.js';
 
 const HELP = `
@@ -41,9 +42,10 @@ QUESTIONS
 
 OPTIONS
   --model <name>              default jev-latest
-  --api-key <key>             overrides TYPESAFE_API_KEY (which is read from .env
-                              in the CURRENT directory, so pass this when running
-                              the CLI from somewhere else)
+  --api-key <key>             overrides TYPESAFE_API_KEY. That variable is read
+                              from the environment, or from a .env file in the
+                              CURRENT directory. Prefer the variable: an argument
+                              is visible in "ps" and in your shell history.
   --json                      print the raw JSON result
   --no-cache                  skip the response cache
   --quiet                     suppress the usage footer
@@ -60,12 +62,29 @@ EXAMPLES
   ak-jev estimate --file contract.txt --questions checks.json
 `;
 
+/** Every flag this CLI knows, so a missing value cannot swallow the next one. */
+const FLAGS = new Set([
+	'-h', '--help', '--json', '--json-state', '--no-cache', '--quiet',
+	'--file', '--questions', '--model', '--api-key', '--noul', '--choice', '--score'
+]);
+
 /**
  * @param {string[]} argv
  */
 function parseArgs(argv) {
 	/** @type {any} */
 	const out = { _: [], noul: [], choice: [], score: [] };
+
+	// Read the value that follows a flag. A missing one must fail loudly: a
+	// dropped `--api-key` value would otherwise fall back to the environment key,
+	// which is the one the user was trying to override.
+	/** @param {number} i index of the value, i.e. the flag's index plus one */
+	const value = (i) => {
+		const v = argv[i];
+		if (v === undefined || FLAGS.has(v)) throw new Error(`${argv[i - 1]} needs a value.`);
+		return v;
+	};
+
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
 		if (a === '-h' || a === '--help') out.help = true;
@@ -73,13 +92,13 @@ function parseArgs(argv) {
 		else if (a === '--json-state') out.jsonState = true;
 		else if (a === '--no-cache') out.noCache = true;
 		else if (a === '--quiet') out.quiet = true;
-		else if (a === '--file') out.file = argv[++i];
-		else if (a === '--questions') out.questionsFile = argv[++i];
-		else if (a === '--model') out.model = argv[++i];
-		else if (a === '--api-key') out.apiKey = argv[++i];
-		else if (a === '--noul') out.noul.push(argv[++i]);
-		else if (a === '--choice') out.choice.push(argv[++i]);
-		else if (a === '--score') out.score.push(argv[++i]);
+		else if (a === '--file') out.file = value(++i);
+		else if (a === '--questions') out.questionsFile = value(++i);
+		else if (a === '--model') out.model = value(++i);
+		else if (a === '--api-key') out.apiKey = value(++i);
+		else if (a === '--noul') out.noul.push(value(++i));
+		else if (a === '--choice') out.choice.push(value(++i));
+		else if (a === '--score') out.score.push(value(++i));
 		else if (a.startsWith('-')) throw new Error(`Unknown flag: ${a}`);
 		else out._.push(a);
 	}
@@ -220,15 +239,10 @@ async function main() {
 		throw new Error('No questions. Use --noul, --choice, --score, or --questions.');
 	}
 
-	const jev = new BaseJev({
-		modelName: args.model,
-		apiKey: args.apiKey,
-		cache: !args.noCache,
-		logLevel: 'warn'
-	});
-
 	if (command === 'estimate') {
-		const est = jev.estimate(state, questions);
+		// Deliberately before the client is built: estimating makes no API call, so
+		// it must not require a key.
+		const est = estimateRequestCost(state, questions, { model: args.model });
 		if (args.json) return console.log(JSON.stringify(est, null, 2));
 		console.log(`questions        ${est.questionCount}`);
 		console.log(`state tokens     ~${est.stateTokens}`);
@@ -240,6 +254,13 @@ async function main() {
 		for (const w of est.warnings) console.log(`  ! ${w}`);
 		return;
 	}
+
+	const jev = new BaseJev({
+		modelName: args.model,
+		apiKey: args.apiKey,
+		cache: !args.noCache,
+		logLevel: 'warn'
+	});
 
 	const result = await jev.evaluate(state, questions);
 

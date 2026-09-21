@@ -118,6 +118,9 @@ export { NOT_STATED } from './extractor.js';
 export { default as log } from './logger.js';
 
 import BaseJev from './base.js';
+import { DEFAULT_MODEL, computeCost } from './models.js';
+import { expandQuestions, toWireQuestions } from './questions.js';
+import { estimateRequest } from './tokens.js';
 import Evaluator from './evaluator.js';
 import Classifier from './classifier.js';
 import Detector from './detector.js';
@@ -189,6 +192,35 @@ export async function models(opts = {}) {
 }
 
 /**
+ * Token and cost estimate for a request, without a client and without an API key.
+ *
+ * Synchronous and free. `BaseJev.estimate()` does the same thing, but building a
+ * `BaseJev` requires a key, and "how big is this?" is a question worth answering
+ * before you have configured anything.
+ *
+ * @param {any} state
+ * @param {Object.<string, any>} questions
+ * @param {{model?: string}} [opts={}]
+ * @returns {import('./tokens.js').JevEstimate & {estimatedCost: number|null}}
+ *
+ * @example
+ * import { estimate, noul } from 'ak-jev';
+ *
+ * const e = estimate(bigDocument, { relevant: noul('Is this about GDPR?') });
+ * if (!e.withinBudget) console.warn(e.warnings.join('\n'));
+ * console.log(`~$${(e.estimatedCost * corpus.length).toFixed(2)} for the whole corpus`);
+ */
+export function estimate(state, questions, opts = {}) {
+	const model = opts.model ?? process.env.TYPESAFE_DEFAULT_MODEL ?? DEFAULT_MODEL;
+	const wire = toWireQuestions(expandQuestions(questions));
+	const est = estimateRequest({ state, questions: wire, model });
+	return {
+		...est,
+		estimatedCost: computeCost({ inputTokens: est.totalTokens, outputTokens: 0 }, model)
+	};
+}
+
+/**
  * Ask the same questions `n` times and report the spread.
  *
  * Jev is consistent but not deterministic: twelve identical requests, measured
@@ -220,6 +252,7 @@ export default {
 	Guard,
 	ask,
 	sample,
+	estimate,
 	models,
 	client,
 	resetClient

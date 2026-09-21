@@ -235,12 +235,15 @@ class BaseJev {
 	 * if (s.summary.refund.agreement < 0.9) sendToHuman(ticket);
 	 */
 	async sample(state, questions, opts = {}) {
-		const n = Math.max(1, Math.floor(opts.n ?? 5));
+		// `n` is a sample() option, not an evaluate() one. Split it off rather than
+		// passing an unknown key down.
+		const { n: requested, ...evaluateOpts } = opts;
+		const n = Math.max(1, Math.floor(requested ?? 5));
 		const draws = await Promise.all(
 			Array.from({ length: n }, () =>
 				// `cache: false` is not enough here — the instance may have one. Pass a
 				// per-call marker that `evaluate()` honours.
-				this.evaluate(state, questions, { ...opts, _bypassCache: true })
+				this.evaluate(state, questions, { ...evaluateOpts, _bypassCache: true })
 			)
 		);
 		return { n, samples: draws, summary: summarizeDraws(draws) };

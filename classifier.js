@@ -8,6 +8,7 @@
 
 import BaseJev from './base.js';
 import { choice } from './questions.js';
+import { requireAnswers } from './answers.js';
 import { JevValidationError } from './errors.js';
 import log from './logger.js';
 
@@ -130,6 +131,7 @@ class Classifier extends BaseJev {
 	 * @returns {Classification}
 	 */
 	_shape(result) {
+		requireAnswers(result.answers, [this.questionId], 'Classifier');
 		const answer = result.answers[this.questionId];
 		const decided = answer.confidence >= this.minConfidence;
 		const alternatives = answer.ranked

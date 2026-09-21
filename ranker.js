@@ -20,6 +20,7 @@
 import BaseJev from './base.js';
 import { noul, score as scoreQuestion, choice } from './questions.js';
 import { estimateQuestionTokens, estimateTokens } from './tokens.js';
+import { requireAnswers } from './answers.js';
 import { JevValidationError } from './errors.js';
 import log from './logger.js';
 
@@ -99,15 +100,19 @@ class Ranker extends BaseJev {
 			batches.map(async (batch) => {
 				/** @type {Object.<string, any>} */
 				const questions = {};
-				for (const { index, text } of batch) {
-					questions[`c${index}`] = this._questionFor(text);
+				// `_batch` already built each question to size it. Reuse those rather
+				// than re-serializing every candidate a second time.
+				for (const { index, question } of batch) {
+					questions[`c${index}`] = question;
 				}
 
 				const result = await this.evaluate({ query }, questions, opts);
+				// A dropped answer would quietly remove a candidate from the ranking,
+				// and the caller would never know it was considered.
+				requireAnswers(result.answers, Object.keys(questions), 'Ranker');
 
 				for (const { index } of batch) {
 					const answer = result.answers[`c${index}`];
-					if (!answer) continue;
 					rows.push({
 						rank: 0, // assigned after the global sort
 						index,
@@ -226,22 +231,23 @@ class Ranker extends BaseJev {
 	 * Split candidates into requests that each fit the token budget.
 	 * @param {any} query
 	 * @param {any[]} candidates
-	 * @returns {Array<Array<{index: number, text: any}>>}
+	 * @returns {Array<Array<{index: number, text: any, question: any}>>}
 	 */
 	_batch(query, candidates) {
 		const limits = this.limits();
 		const queryTokens = estimateTokens({ query }) + limits.requestOverheadTokens;
 		const budget = Math.min(this.batchTokens, limits.contextTokens) - queryTokens;
 
-		/** @type {Array<Array<{index: number, text: any}>>} */
+		/** @type {Array<Array<{index: number, text: any, question: any}>>} */
 		const batches = [];
-		/** @type {Array<{index: number, text: any}>} */
+		/** @type {Array<{index: number, text: any, question: any}>} */
 		let current = [];
 		let used = 0;
 
 		candidates.forEach((candidate, index) => {
 			const text = this.toText(candidate, index);
-			const cost = estimateQuestionTokens(this._questionFor(text));
+			const question = this._questionFor(text);
+			const cost = estimateQuestionTokens(question);
 
 			// One oversized candidate gets its own request rather than being dropped.
 			// The API will reject it if it truly does not fit, with a clear error.
@@ -250,7 +256,7 @@ class Ranker extends BaseJev {
 				current = [];
 				used = 0;
 			}
-			current.push({ index, text });
+			current.push({ index, text, question });
 			used += cost;
 		});
 

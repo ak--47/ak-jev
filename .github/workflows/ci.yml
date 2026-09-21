@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+
+      # The unit suite stubs fetch and points TYPESAFE_BASE_URL at an
+      # unresolvable host, so CI cannot reach the API and cannot spend money.
+      # The live suite is gated on JEV_LIVE=1 and is deliberately not run here.
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build:cjs
+
+      # The committed bundle must match what the source builds to.
+      - name: index.cjs is up to date
+        run: git diff --exit-code -- index.cjs

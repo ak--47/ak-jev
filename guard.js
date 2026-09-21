@@ -19,6 +19,7 @@
 
 import BaseJev from './base.js';
 import { noul } from './questions.js';
+import { requireAnswers } from './answers.js';
 import { JevError, JevValidationError } from './errors.js';
 import log from './logger.js';
 
@@ -199,6 +200,10 @@ class Guard extends BaseJev {
 	 * @returns {Verdict}
 	 */
 	_shape(result) {
+		// A dropped hazard would read as "did not fire", which is the dangerous
+		// direction for a guard. Stop instead.
+		requireAnswers(result.answers, this.hazardIds, 'Guard');
+
 		/** @type {Object.<string, number>} */
 		const probabilities = {};
 		/** @type {Array<{id: string, probability: number, action: string, threshold: number, description: string|null}>} */
@@ -207,7 +212,6 @@ class Guard extends BaseJev {
 
 		for (const id of this.hazardIds) {
 			const answer = result.answers[id];
-			if (!answer) continue;
 			const spec = this.hazards[id];
 			const p = answer.noul;
 			probabilities[id] = p;

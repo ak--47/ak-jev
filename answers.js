@@ -10,6 +10,8 @@
  * numbers came from the model and which came from arithmetic.
  */
 
+import { JevValidationError } from './errors.js';
+
 /** Defaults for turning a Noul probability into a decision. */
 export const DEFAULT_THRESHOLDS = Object.freeze({
 	/** `answer.yes` is true at or above this. */
@@ -163,6 +165,35 @@ export function enrichAnswers(answers, opts = {}) {
 		});
 	}
 	return out;
+}
+
+/**
+ * Assert that every question id came back with an answer.
+ *
+ * The API returns one answer per question, so a gap here means something is
+ * genuinely wrong: a truncated response, or a question id that collided with one
+ * the caller passed through `opts.questions`.
+ *
+ * Every class calls this before reading answers. The alternative — skipping the
+ * missing id — produces a composite score, a flag set, or an extracted record
+ * that looks complete and is not. A quiet wrong number is worse than a loud stop,
+ * and the `*Many` methods already capture a throw as a per-item failure.
+ *
+ * @param {Object.<string, any>} answers
+ * @param {string[]} ids
+ * @param {string} className for the message
+ * @throws {JevValidationError} when any id is missing
+ */
+export function requireAnswers(answers, ids, className) {
+	const missing = ids.filter((id) => !answers?.[id]);
+	if (missing.length === 0) return;
+	throw new JevValidationError(
+		`${className}: the API returned no answer for ${missing.map((m) => `"${m}"`).join(', ')}. ` +
+			`Expected ${ids.length} answers, got ${Object.keys(answers ?? {}).length}. ` +
+			'A question id passed through opts.questions may have collided with one of the ' +
+			"class's own ids.",
+		{ questionId: missing[0] }
+	);
 }
 
 // ── helpers, also exported because they are useful on their own ──────────────

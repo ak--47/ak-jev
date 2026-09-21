@@ -14,6 +14,7 @@
 
 import BaseJev from './base.js';
 import { choice } from './questions.js';
+import { requireAnswers } from './answers.js';
 import { JevValidationError } from './errors.js';
 import log from './logger.js';
 
@@ -138,6 +139,10 @@ class Extractor extends BaseJev {
 	 * @returns {Extraction}
 	 */
 	_shape(result) {
+		// A dropped field would be indistinguishable from one the document did not
+		// state. Those mean very different things. Stop instead.
+		requireAnswers(result.answers, this.fieldNames, 'Extractor');
+
 		/** @type {Object.<string, any>} */
 		const record = {};
 		/** @type {Object.<string, any>} */
@@ -149,7 +154,6 @@ class Extractor extends BaseJev {
 
 		for (const name of this.fieldNames) {
 			const answer = result.answers[name];
-			if (!answer) continue;
 			const spec = this.fieldSpecs[name];
 
 			const notStated = answer.choice === NOT_STATED;
@@ -158,7 +162,18 @@ class Extractor extends BaseJev {
 
 			// Copy the label verbatim, then normalize. Never re-type the value.
 			let value = decided ? answer.choice : null;
-			if (decided && spec.transform) value = spec.transform(value, answer);
+			if (decided && spec.transform) {
+				try {
+					value = spec.transform(value, answer);
+				} catch (err) {
+					// A bare "boom" from deep in a map lookup tells the caller nothing.
+					throw new JevValidationError(
+						`Extractor: the transform for field "${name}" threw on the value ` +
+							`${JSON.stringify(answer.choice)}: ${/** @type {Error} */ (err)?.message}`,
+						{ questionId: name }
+					);
+				}
+			}
 
 			record[name] = value;
 			fields[name] = {

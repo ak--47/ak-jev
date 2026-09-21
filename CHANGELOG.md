@@ -41,6 +41,28 @@ One readable message from the API's three different `detail` shapes.
 `JevRequestTooLargeError` supplies its own message and the fix, because
 `{"detail":{"error_type":"max_tokens_exceeded"}}` carries none.
 
+### Hardening applied during pre-release review
+
+- **Every class now refuses a response with a missing answer** instead of skipping
+  it. A dropped dimension used to shrink a `Scorer` composite silently; a dropped
+  `Guard` hazard used to read as "did not fire". `requireAnswers()` names the
+  missing ids and points at the likeliest cause, an `opts.questions` id colliding
+  with one of the class's own.
+- **`Extractor` names the field when a `transform` throws**, rather than surfacing
+  the bare error from inside your callback.
+- **A disk-backed cache no longer grows memory without bound.** Entries read back
+  off disk now go through the same LRU eviction as writes.
+- **`sample()` no longer leaks its `n` option** into the per-call evaluate options.
+- **`Ranker` builds each candidate's question once**, not twice. It was serialized
+  to size the batch and again to send it — doubled work on every candidate.
+- **`Taxonomy` reports `truncated: true`** when `maxDepth` stopped the walk above a
+  leaf, so a partial path is distinguishable from a complete one.
+- **Standalone `estimate(state, questions)`** export. Synchronous, free, and needs
+  no API key, so `ak-jev estimate` works without one and you can size a job before
+  configuring a client.
+- **CLI `--api-key`**, and every value-taking flag now rejects a missing value
+  rather than silently reading the next flag as its argument.
+
 ### Tooling
 
 - Hand-written `types.d.ts`. Answer types are inferred from question criteria: a

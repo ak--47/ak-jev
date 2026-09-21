@@ -51,6 +51,88 @@ Get one at [console.typesafe.ai/keys](https://console.typesafe.ai/keys).
 
 ---
 
+## Which one do I use?
+
+Nine classes is a lot. You only ever need one at a time. Find your sentence:
+
+| If you are saying… | Use | Because |
+|---|---|---|
+| "I have a thing, and I want to know six different facts about it" | **`Evaluator`** | One question set, one request, six answers. The default choice. |
+| "Put this into exactly one of these buckets" | **`Classifier`** | One Choice, with a confidence bar and somewhere for the unsure ones to go |
+| "Check this against a list of yes/no conditions" | **`Detector`** | One Noul per condition, per-condition thresholds, all in one request |
+| "Rank these by something with several parts to it" | **`Scorer`** | Weighted composite, normalized so the parts are comparable |
+| "Decide what this is, then actually go do that thing" | **`Router`** | Classify plus dispatch, with a different bar per action |
+| "Which of these 200 documents answers my question?" | **`Ranker`** | Scores every candidate, batched; no embeddings involved |
+| "Pull fields out of this messy text" | **`Extractor`** | Choice over allowed values, so the output cannot be a hallucination |
+| "Classify into my 4,000-category tree" | **`Taxonomy`** | Walks the tree level by level, past the 255-option ceiling |
+| "Is it safe to send this to my LLM / to a user?" | **`Guard`** | Hazards in, `allow` / `review` / `block` out |
+
+And three functions that are not classes:
+
+| Function | For |
+|---|---|
+| `ask(state, questions)` | A one-off. No setup, no class. Reach for `Evaluator` once you call it twice. |
+| `sample(state, questions, {n})` | "Can I trust this number?" Runs it n times and reports the spread. |
+| `estimate(state, questions)` | "How much will this cost?" Synchronous, free, needs no API key. |
+
+### A worked example of the difference
+
+Say you have a support ticket. Here is the same ticket through four classes, and
+why you would pick each.
+
+```javascript
+const ticket = "Charged twice for order A-104. Third time I've written in. I'm done.";
+```
+
+**`ask`** — you just want to know one thing, once:
+
+```javascript
+const { answers } = await ask(ticket, { refund: 'Do they want money back?' });
+answers.refund.noul;        // 0.66
+```
+
+**`Classifier`** — you need exactly one bucket, and you care about not guessing:
+
+```javascript
+const r = await dept.classify(ticket);
+r.label;        // 'billing'   ← or 'needs_human' if confidence was below your bar
+r.decided;      // true
+r.runnerUp;     // { label: 'returns', probability: 0.31 }  ← worth cc-ing
+```
+
+**`Scorer`** — you need a number you can sort a queue by:
+
+```javascript
+const r = await priority.score(ticket);
+r.composite;    // 0.81   ← 0.6 × severity + 0.3 × frustration + 0.1 × detail
+r.weakest;      // 'frustration'  ← the part the model was least sure about
+```
+
+**`Router`** — you want the work to actually happen:
+
+```javascript
+const out = await router.route(ticket, { ticketId: 'T-1' });
+out.route;      // 'refund'
+out.value;      // whatever issueRefund() returned
+```
+
+The pattern to notice: `Classifier` gives you a **label**, `Scorer` gives you a
+**number**, `Router` gives you an **effect**. Pick by what your next line of code
+needs.
+
+### Starting from scratch? Do this
+
+1. Write down the decisions your code makes about one item. Not the prose you want
+   — the `if` statements.
+2. Turn each into one question. `noul` for yes/no, `choice` for a fixed set,
+   `score` for a spectrum.
+3. Put them all in one `Evaluator`. Ask everything, including the questions that
+   only matter sometimes — 200 questions cost the same wall time as one.
+4. Run `node examples/01-triage-a-ticket.mjs` to see that shape working end to end.
+5. Once it works, look at whether a narrower class fits better.
+
+---
+
 ## Why this and not `@typesafe-ai/sdk`
 
 TypeSafe's own JS SDK is a clean, thin HTTP client with good types. ak-jev is built
@@ -199,7 +281,16 @@ of them have `evaluate()`, `sample()`, `estimate()`, `getLastUsage()` and `stats
 
 ### Evaluator
 
-The workhorse. Declare the questions once, run them over anything.
+**Reach for it when** one item needs several unrelated judgments at once, and your
+code will decide afterwards which of them mattered.
+
+*Real use:* support triage. Every ticket needs a category, and a bug ticket also
+needs a severity, and a billing ticket also needs to know whether a refund was
+asked for. Ask all of it, every time. The severity answer on a feature request
+costs about 30 tokens and you throw it away.
+
+*Not this when:* you only need one label (use `Classifier`) or you want the work
+dispatched for you (use `Router`).
 
 ```javascript
 import { Evaluator, noul, choice, score } from 'ak-jev';
@@ -245,6 +336,13 @@ for await (const { index, result, error } of triage.stream(tickets)) {
 
 ### Classifier
 
+**Reach for it when** an item belongs in exactly one bucket and you need somewhere
+for the ones the model is not sure about.
+
+*Real use:* routing inbound email to a team. The important part is not the happy
+path — it is that a 40/35/25 three-way split does **not** silently become
+"billing". It becomes `needs_human`.
+
 ```javascript
 const dept = new Classifier({
   instructions: 'Which team should handle this ticket?',
@@ -269,6 +367,16 @@ const groups = await dept.group(tickets);   // { billing: [...], needs_human: [.
 
 ### Detector
 
+**Reach for it when** you have a checklist of independent yes/no conditions and
+the interesting output is *which ones fired*.
+
+*Real use:* PII and policy scanning before text is stored, logged, or sent
+onward. Each condition gets its own bar, because "mentions a card number" and
+"mentions a city" do not deserve the same trigger point.
+
+*Not this when:* the conditions are really one spectrum (use `Scorer`) or you want
+an allow/block decision out the other end (use `Guard`).
+
 One Noul per condition, one request, per-condition thresholds.
 
 ```javascript
@@ -292,6 +400,17 @@ r.flags.email // true
 ```
 
 ### Scorer
+
+**Reach for it when** you need to rank or prioritise, and the ranking depends on
+several things you can weigh against each other.
+
+*Real use:* a support queue ordered by priority, or a stack of resumes ordered for
+a specific role. The payoff is `Scorer.reweight()`: score a candidate once, then
+rank them as a senior IC **and** as an engineering manager from the same answers,
+with no second API call.
+
+*Not this when:* the judgment is really one dimension — then it is a single
+`score()` question inside an `Evaluator`.
 
 Composite scoring with the two things people get wrong handled for you:
 every dimension is normalized by its own level count before weighting, and all the
@@ -321,6 +440,14 @@ const ranked = await priority.rank(tickets, { top: 20 });
 
 ### Router
 
+**Reach for it when** the classification's whole purpose is to decide which code
+runs next, and different branches carry different risk.
+
+*Real use:* a voice or chat assistant over a real account. Reading a balance at
+0.6 confidence is fine; the worst case is the user hearing a number they did not
+ask for. Approving a transfer at 0.6 is not fine. Same model, same call, different
+bars.
+
 Classify, then dispatch. Each route carries **its own** confidence bar, because
 showing the wrong screen is recoverable and approving the wrong transfer is not.
 
@@ -346,6 +473,15 @@ Handlers receive `{ state, extra, route, confidence, answers, classification }`.
 Set `dispatch: false` to get the decision without running anything.
 
 ### Ranker
+
+**Reach for it when** you have a query and a pile of candidates, and you need them
+ordered by how well they actually answer it.
+
+*Real use:* the retrieval step of a RAG pipeline. Pull 200 candidates cheaply with
+BM25 or a SQL `LIKE`, then let Jev re-rank them and feed only the top 8 to an
+expensive model. No vector store, no index to rebuild, no chunking strategy, and
+`relevance` is a real probability you can threshold rather than a cosine distance
+you have to calibrate.
 
 Semantic search and re-ranking. One question per candidate, batched into as few
 requests as the token budget allows. Each candidate travels inside its **own**
@@ -377,6 +513,17 @@ new Ranker({ instructions: '…', toText: (doc) => doc.body });
 ```
 
 ### Extractor
+
+**Reach for it when** you need fields out of messy text **and** you can enumerate
+what each field is allowed to be.
+
+*Real use:* normalising invoices, forms, or listings from many sources into one
+schema. The guarantee is stronger than JSON-mode on an LLM: the output is not
+validated against your allowed values, it is *selected from* them, so a value
+outside the set is not representable.
+
+*Not this when:* the field is open-ended, like a summary or a customer's name. Jev
+cannot generate. Use an LLM for those and Jev to check the result.
 
 Jev cannot write text. The documented workaround is to turn extraction into a
 Choice over the possible values, so the model **picks** rather than generates. The
@@ -411,6 +558,14 @@ an absence.
 
 ### Taxonomy
 
+**Reach for it when** your category list is bigger than 255, or deep enough that a
+flat list would lose the structure.
+
+*Real use:* a product catalogue, an ICD or SIC code set, a support-topic tree. It
+is the only class that makes more than one call per item, and it is worth it: a
+water bottle sits under both Sporting Goods and Home & Kitchen, and `beam: 2`
+explores both before committing.
+
 A Choice allows 255 options, which is nothing for a real catalogue. Walk the tree
 instead: one Choice per level, with the children as options and their subtrees as
 descriptions. Beam search keeps several paths alive when the probabilities are
@@ -437,6 +592,14 @@ docs allow: the next level's options do not exist until the previous answer pick
 a branch.
 
 ### Guard
+
+**Reach for it when** something is about to cross a boundary — into your LLM, out
+to a user, into your database — and you want a policy decision first.
+
+*Real use:* wrapping a customer-facing assistant. At a thousandth of the cost of
+the model call it is guarding, you can check every prompt and every completion
+rather than sampling. `guard.wrap(fn)` puts the check on both sides so it cannot
+be forgotten.
 
 ```javascript
 const guard = new Guard({
@@ -535,13 +698,21 @@ $0.042 per million **input** tokens. Output tokens are free. A typical
 three-question triage call costs about **$0.000016**.
 
 ```javascript
-const est = jev.estimate(ticket, questions);
+import { estimate } from 'ak-jev';
+
+// Synchronous, free, and needs no API key — so you can size a job before you
+// have configured anything.
+const est = estimate(ticket, questions);
 est.totalTokens         // 388   nominal; what cost is based on
 est.budgetTokens        // 485   padded; what the budget check uses
 est.estimatedCost       // 0.0000163
 est.withinBudget        // true
 est.warnings            // []
+
+console.log(`~$${(est.estimatedCost * corpus.length).toFixed(2)} for the whole corpus`);
 ```
+
+`jev.estimate(...)` on any client is the same calculation.
 
 Every hard limit is checked **before** the request, because each one is a 400 that
 costs a round trip and does not say which question caused it:
