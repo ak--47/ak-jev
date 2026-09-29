@@ -18,7 +18,7 @@ import {
 	JevRateLimitError,
 	errorFromResponse
 } from './errors.js';
-import { DEFAULT_BASE_URL, MODELS_PATH, SYSTEM_ONE_PATH } from './models.js';
+import { MODELS_PATH, SYSTEM_ONE_PATH, resolveProvider } from './models.js';
 import { Governor, sleep } from './governor.js';
 import log from './logger.js';
 
@@ -48,8 +48,10 @@ export const DEFAULT_TIMEOUT_MS = 30_000;
 export class JevClient {
 	/**
 	 * @param {Object} [config={}]
-	 * @param {string} [config.apiKey] falls back to `TYPESAFE_API_KEY`, then `JEV_API_KEY`
-	 * @param {string} [config.baseURL] falls back to `TYPESAFE_BASE_URL`, then the public API
+	 * @param {string} [config.provider] `typesafe` or `litellm`; falls back to `JEV_PROVIDER`
+	 * @param {string} [config.apiKey] falls back to the provider's key variable
+	 *   (`TYPESAFE_API_KEY` then `JEV_API_KEY`, or `LITELLM_API_KEY`)
+	 * @param {string} [config.baseURL] falls back to the provider's base URL
 	 * @param {number} [config.timeout] per attempt, ms
 	 * @param {Partial<typeof DEFAULT_RETRY>} [config.retry]
 	 * @param {Object.<string,string>} [config.defaultHeaders]
@@ -58,17 +60,21 @@ export class JevClient {
 	 * @param {string} [config.userAgent]
 	 */
 	constructor(config = {}) {
-		const apiKey = config.apiKey ?? process.env.TYPESAFE_API_KEY ?? process.env.JEV_API_KEY;
+		const provider = resolveProvider(config.provider);
+		const apiKey = config.apiKey ?? provider.apiKey;
 		if (!apiKey) {
 			throw new JevConfigError(
-				'No API key. Pass { apiKey } to the constructor, or set TYPESAFE_API_KEY ' +
-					'in the environment. Get a key at https://console.typesafe.ai/keys'
+				`No API key. Pass { apiKey } to the constructor, or set ${provider.keyEnv[0]} ` +
+					`in the environment. ${provider.keyHelp}`
 			);
 		}
+		/** @type {string} */
+		this.provider = provider.name;
+		/** @type {string} the variable a 401 message tells the caller to set */
+		this.keyEnv = provider.keyEnv[0];
 		this.apiKey = apiKey;
-		this.baseURL = (config.baseURL ?? process.env.TYPESAFE_BASE_URL ?? DEFAULT_BASE_URL)
-			.replace(/\/+$/, '');
-		this.timeout = config.timeout ?? DEFAULT_TIMEOUT_MS;
+		this.baseURL = (config.baseURL ?? provider.baseURL).replace(/\/+$/, '');
+		this.timeout = config.timeout ?? provider.timeout ?? DEFAULT_TIMEOUT_MS;
 		this.retry = { ...DEFAULT_RETRY, ...(config.retry ?? {}) };
 		this.defaultHeaders = { ...(config.defaultHeaders ?? {}) };
 		this.fetch = config.fetch ?? globalThis.fetch;
@@ -226,7 +232,13 @@ export class JevClient {
 		}
 
 		if (!res.ok) {
-			throw errorFromResponse({ status: res.status, body: data, headers: responseHeaders, requestId });
+			throw errorFromResponse({
+				status: res.status,
+				body: data,
+				headers: responseHeaders,
+				requestId,
+				keyEnv: this.keyEnv
+			});
 		}
 
 		return { data, requestId, status: res.status, headers: responseHeaders, latencyMs };
@@ -272,4 +284,32 @@ export function backoffDelay(err, attempt, retry) {
 	// Subtract up to `backoffJitter` of the delay, so a burst of clients that all
 	// got a 429 at the same moment do not all come back at the same moment.
 	return Math.max(0, base * (1 - Math.random() * retry.backoffJitter));
+}
+
+/**
+ * Read the LiteLLM gateway's `x-litellm-*` headers, when the litellm provider
+ * returns them. Every field is absent on the typesafe provider.
+ *
+ * The gateway updates `x-litellm-key-spend` asynchronously: it is the key's
+ * cumulative spend as of the gateway's last settle, and can lag a minute or more
+ * behind the call that carries it. It is never this call's cost.
+ *
+ * @param {Object.<string,string>} [headers={}] lower-cased, as `Object.fromEntries(res.headers)` gives them
+ * @returns {{responseCost?: number, callId?: string, keySpend?: number}}
+ */
+export function gatewayMeta(headers = {}) {
+	/** @param {string} name */
+	const num = (name) => {
+		if (headers[name] === undefined || headers[name] === '') return undefined;
+		const n = Number(headers[name]);
+		return Number.isFinite(n) ? n : undefined;
+	};
+	/** @type {{responseCost?: number, callId?: string, keySpend?: number}} */
+	const out = {};
+	const responseCost = num('x-litellm-response-cost');
+	if (responseCost !== undefined) out.responseCost = responseCost;
+	if (headers['x-litellm-call-id']) out.callId = headers['x-litellm-call-id'];
+	const keySpend = num('x-litellm-key-spend');
+	if (keySpend !== undefined) out.keySpend = keySpend;
+	return out;
 }

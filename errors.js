@@ -143,7 +143,9 @@ export class JevOverloadedError extends JevAPIError {}
 export class JevServerError extends JevAPIError {}
 
 /**
- * Flatten any of the three `detail` shapes into one readable sentence.
+ * Flatten any of the three `detail` shapes into one readable sentence, plus the
+ * LiteLLM gateway's own `{error: {message, type}}` shape, which it returns
+ * before the request ever reaches the model (a bad key, for one).
  *
  * @param {any} body the parsed response body, or `undefined` if it did not parse
  * @param {number} status
@@ -151,6 +153,15 @@ export class JevServerError extends JevAPIError {}
  */
 export function describeDetail(body, status) {
 	const detail = body?.detail;
+
+	// Gateway shape: the litellm provider rejects some requests itself.
+	if (detail === undefined && body?.error && typeof body.error === 'object') {
+		const errorType = typeof body.error.type === 'string' ? body.error.type : undefined;
+		const message = typeof body.error.message === 'string' && body.error.message
+			? body.error.message
+			: `HTTP ${status}`;
+		return { message, errorType, fields: [] };
+	}
 
 	// Shape 3: FastAPI validation array.
 	if (Array.isArray(detail)) {
@@ -192,15 +203,26 @@ export function describeDetail(body, status) {
  * @param {any} args.body parsed response body
  * @param {Object.<string,string>} args.headers
  * @param {string|undefined} args.requestId
+ * @param {string} [args.keyEnv='TYPESAFE_API_KEY'] the variable to name in a 401
  * @returns {JevAPIError}
  */
-export function errorFromResponse({ status, body, headers, requestId }) {
+export function errorFromResponse({ status, body, headers, requestId, keyEnv = 'TYPESAFE_API_KEY' }) {
 	const { message, errorType, fields } = describeDetail(body, status);
-	const meta = { status, detail: body?.detail, errorType, requestId, headers };
+	const meta = { status, detail: body?.detail ?? body?.error, errorType, requestId, headers };
 
 	if (status === 401) {
 		return new JevAuthError(
-			`${message} Set TYPESAFE_API_KEY, or pass { apiKey } to the constructor.`,
+			`${message} Set ${keyEnv}, or pass { apiKey } to the constructor.`,
+			meta
+		);
+	}
+	// Kev, on the litellm provider, reports an oversize state as a 422 string
+	// rather than Jev's 400 `max_tokens_exceeded`. Its message names the limit.
+	if (status === 422 && typeof body?.detail === 'string' && /branch too long/.test(body.detail)) {
+		return new JevRequestTooLargeError(
+			`${message}. The state plus the single longest question must fit the model's ` +
+				'row limit. Filter the state down to what the questions actually need. ' +
+				'Call estimate() to check before sending.',
 			meta
 		);
 	}

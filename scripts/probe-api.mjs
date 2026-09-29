@@ -5,24 +5,57 @@
  *
  *   npm run probe-api
  *   npm run probe-api -- --json
+ *   npm run probe-api -- --provider litellm     Kev on Mixpanel's gateway
  *
- * Costs well under a cent. Run it before trusting anything in AGENTS.md — the
- * determinism claim in the first draft of this package was wrong because it was
- * checked with a sample size of two.
+ * Costs well under a cent on typesafe, and nothing on litellm (kev-latest is
+ * free). Run it before trusting anything in AGENTS.md — the determinism claim in
+ * the first draft of this package was wrong because it was checked with a sample
+ * size of two.
  */
 
 import 'dotenv/config';
-import { MODEL_LIMITS, MODEL_PRICING, MODEL_PRICING_AS_OF } from '../models.js';
+import { MODEL_PRICING, MODEL_PRICING_AS_OF, computeCost, resolveLimits, resolveProvider } from '../models.js';
 
-const KEY = process.env.TYPESAFE_API_KEY;
-const BASE = (process.env.TYPESAFE_BASE_URL ?? 'https://api.typesafe.ai').replace(/\/+$/, '');
+const argProvider = process.argv.indexOf('--provider');
+const PROVIDER = resolveProvider(argProvider > -1 ? process.argv[argProvider + 1] : undefined);
+const KEY = PROVIDER.apiKey;
+const BASE = PROVIDER.baseURL;
+const MODEL = PROVIDER.defaultModel;
+const GATEWAY = PROVIDER.name === 'litellm';
 const JSON_OUT = process.argv.includes('--json');
-const LIMITS = MODEL_LIMITS['jev-1.13.0'];
+const LIMITS = resolveLimits(MODEL, PROVIDER);
+
+/**
+ * The two providers reject the same bad request in different ways. Each entry is
+ * what that provider measurably does, so a diff means drift, not a known gap.
+ */
+const EXPECT = GATEWAY
+	? {
+		overLimitStatus: 422,       // 256 choices / 256 score levels: FastAPI validation array
+		emptyChoiceStatus: 422,
+		bareNoulStatus: 200,        // Kev accepts a Noul with neither field; ak-jev still refuses it
+		oversizeStatus: 422,
+		authShape: 'error',         // the gateway answers before the model does
+		missingModelStatus: 200,    // the pass-through serves every request from Kev
+		unknownModelStatus: 200
+	}
+	: {
+		overLimitStatus: 400,
+		emptyChoiceStatus: 400,
+		bareNoulStatus: 400,
+		oversizeStatus: 400,
+		authShape: 'detail',
+		missingModelStatus: 422,
+		unknownModelStatus: 400
+	};
 
 if (!KEY) {
-	console.error('TYPESAFE_API_KEY is not set. Copy .env.example to .env and fill it in.');
+	console.error(`${PROVIDER.keyEnv[0]} is not set. Copy .env.example to .env and fill it in.`);
 	process.exit(1);
 }
+
+/** Last `x-litellm-key-spend` seen. The gateway settles it late, so it lags. */
+let keySpend;
 
 let inputTokens = 0;
 let requests = 0;
@@ -32,8 +65,10 @@ async function post(body) {
 	const res = await fetch(`${BASE}/v1/systemone`, {
 		method: 'POST',
 		headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' },
-		body: JSON.stringify({ model: 'jev-latest', ...body })
+		body: JSON.stringify({ model: MODEL, ...body })
 	});
+	const spend = res.headers.get('x-litellm-key-spend');
+	if (spend !== null) keySpend = Number(spend);
 	const parsed = await res.json().catch(() => null);
 	inputTokens += parsed?.usage?.input_tokens ?? 0;
 	return { status: res.status, body: parsed, ms: 0 };
@@ -68,7 +103,7 @@ async function probeRoster() {
 	record('models', (body.models ?? []).map((m) => m.name).join(', '));
 
 	const r = await post({ state: 'hello', questions: { a: NOUL('Is this a greeting?') } });
-	record('model that answers jev-latest', r.body?.model);
+	record(`model that answers ${MODEL}`, r.body?.model);
 	if (!MODEL_PRICING[r.body?.model]) {
 		findings.push({
 			name: 'pricing table covers the answering model',
@@ -90,17 +125,19 @@ async function probeLimits() {
 
 	const c255 = await post({ state: 'x', questions: { a: { type: 'choice', instructions: 'p', criteria: opts(255) } } });
 	const c256 = await post({ state: 'x', questions: { a: { type: 'choice', instructions: 'p', criteria: opts(256) } } });
-	check('max choice options', LIMITS.maxChoiceOptions, c255.status === 200 && c256.status === 400 ? 255 : `255=${c255.status} 256=${c256.status}`);
+	check('max choice options', LIMITS.maxChoiceOptions, c255.status === 200 && c256.status === EXPECT.overLimitStatus ? 255 : `255=${c255.status} 256=${c256.status}`);
 
-	const s10 = await post({ state: 'x', questions: { a: { type: 'score', instructions: 'r', criteria: levels(10) } } });
-	const s11 = await post({ state: 'x', questions: { a: { type: 'score', instructions: 'r', criteria: levels(11) } } });
-	check('max score levels', LIMITS.maxScoreLevels, s10.status === 200 && s11.status === 400 ? 10 : `10=${s10.status} 11=${s11.status}`);
+	const maxLevels = LIMITS.maxScoreLevels;
+	const sMax = await post({ state: 'x', questions: { a: { type: 'score', instructions: 'r', criteria: levels(maxLevels) } } });
+	const sOver = await post({ state: 'x', questions: { a: { type: 'score', instructions: 'r', criteria: levels(maxLevels + 1) } } });
+	check('max score levels', maxLevels, sMax.status === 200 && sOver.status === EXPECT.overLimitStatus ? maxLevels : `${maxLevels}=${sMax.status} ${maxLevels + 1}=${sOver.status}`);
 
 	const empty = await post({ state: 'x', questions: { a: { type: 'choice', instructions: 'p', criteria: {} } } });
-	check('empty choice is rejected', 400, empty.status);
+	check('empty choice is rejected', EXPECT.emptyChoiceStatus, empty.status);
 
 	const bare = await post({ state: 'x', questions: { a: { type: 'noul' } } });
-	check('noul with neither instructions nor criteria is rejected', 400, bare.status);
+	check('noul with neither instructions nor criteria', EXPECT.bareNoulStatus, bare.status,
+		GATEWAY ? 'Kev accepts it; validateQuestions() still refuses it, so code stays portable' : undefined);
 
 	const one = await post({ state: 'x', questions: { a: { type: 'score', instructions: 'r', criteria: ['only'] } } });
 	check('one-level score is accepted (warn, do not throw)', 200, one.status);
@@ -116,11 +153,14 @@ async function probeContext() {
 	const filler = (n) =>
 		Array.from({ length: n }, (_, i) => `record ${i} alpha beta gamma delta epsilon ${i * 7} zeta eta theta iota kappa `).join('');
 
+	// One filler record is about 18 tokens. Search up to twice the configured
+	// budget, in steps of about 1/25 of the range.
 	let lo = 0;
-	let hi = 6000;      // records, not characters
+	let hi = Math.ceil(LIMITS.stateTokens / 5);   // records, not characters
+	const step = Math.max(10, Math.floor(hi / 25));
 	let maxTokens = 0;
 
-	while (hi - lo > 250) {
+	while (hi - lo > step) {
 		const mid = Math.floor((lo + hi) / 2);
 		const r = await post({ state: filler(mid), questions: { a: NOUL('Does this mention GDPR?') } });
 		if (r.status === 200) {
@@ -133,11 +173,16 @@ async function probeContext() {
 	record('largest single-question request accepted, input tokens', maxTokens,
 		`configured stateTokens budget is ${LIMITS.stateTokens}`);
 
-	const over = await post({ state: filler(hi + 1000), questions: { a: NOUL('x?') } });
-	check('oversize error status', 400, over.status);
-	check('oversize error_type', 'max_tokens_exceeded', over.body?.detail?.error_type);
-	check('oversize error carries no message', undefined, over.body?.detail?.message,
-		'this is why JevRequestTooLargeError writes its own');
+	const over = await post({ state: filler(hi + Math.ceil(hi / 6)), questions: { a: NOUL('x?') } });
+	check('oversize error status', EXPECT.oversizeStatus, over.status);
+	if (GATEWAY) {
+		check('oversize detail names the row limit', true, /branch too long/.test(String(over.body?.detail)),
+			'errorFromResponse() maps this 422 to JevRequestTooLargeError');
+	} else {
+		check('oversize error_type', 'max_tokens_exceeded', over.body?.detail?.error_type);
+		check('oversize error carries no message', undefined, over.body?.detail?.message,
+			'this is why JevRequestTooLargeError writes its own');
+	}
 }
 
 // ── error shapes ─────────────────────────────────────────────────────────────
@@ -146,11 +191,18 @@ async function probeErrors() {
 	const res = await fetch(`${BASE}/v1/models`, { headers: { Authorization: 'Bearer definitely-not-a-key' } });
 	const body = await res.json();
 	check('401 status', 401, res.status);
-	check('401 detail shape', 'object', typeof body.detail);
-	check('401 error_type', 'authentication_error', body.detail?.error_type);
+	if (EXPECT.authShape === 'error') {
+		check('401 gateway error shape', 'object', typeof body.error);
+		record('401 gateway error type', body.error?.type);
+	} else {
+		check('401 detail shape', 'object', typeof body.detail);
+		check('401 error_type', 'authentication_error', body.detail?.error_type);
+	}
 
-	const bad = await post({ state: 'x', questions: { a: { type: 'choice', instructions: 'p', criteria: {} } } });
-	check('common 400 detail shape', 'string', typeof bad.body?.detail);
+	if (!GATEWAY) {
+		const bad = await post({ state: 'x', questions: { a: { type: 'choice', instructions: 'p', criteria: {} } } });
+		check('common 400 detail shape', 'string', typeof bad.body?.detail);
+	}
 
 	const res422 = await fetch(`${BASE}/v1/systemone`, {
 		method: 'POST',
@@ -158,13 +210,16 @@ async function probeErrors() {
 		body: JSON.stringify({ state: 'x', questions: { a: NOUL('y') } }) // no model
 	});
 	const body422 = await res422.json();
-	check('missing model status', 422, res422.status);
-	check('422 detail shape', true, Array.isArray(body422.detail));
-	check('model is a required field', 'model', body422.detail?.[0]?.loc?.[1]);
+	check('missing model status', EXPECT.missingModelStatus, res422.status);
+	if (!GATEWAY) {
+		check('422 detail shape', true, Array.isArray(body422.detail));
+		check('model is a required field', 'model', body422.detail?.[0]?.loc?.[1]);
+	}
 
 	const unknown = await post({ state: 'x', model: 'gpt-9', questions: { a: NOUL('y') } });
-	check('unknown model status', 400, unknown.status);
-	check('unknown model error_type', 'api_usage_error', unknown.body?.detail?.error_type);
+	check('unknown model status', EXPECT.unknownModelStatus, unknown.status,
+		GATEWAY ? 'the gateway serves every model name from the same Kev server' : undefined);
+	if (!GATEWAY) check('unknown model error_type', 'api_usage_error', unknown.body?.detail?.error_type);
 }
 
 // ── fan-out ──────────────────────────────────────────────────────────────────
@@ -180,7 +235,9 @@ async function probeFanOut() {
 		results.push({ questions: n, status: r.status, ms: r.ms, inputTokens: r.body?.usage?.input_tokens });
 	}
 	record('fan-out latency', results.map((r) => `${r.questions}q=${r.ms}ms`).join('  '),
-		'latency should be roughly flat in question count');
+		GATEWAY
+			? 'Kev latency grows with question count (1,000 questions took 30 s); the litellm timeout default is 120 s'
+			: 'latency should be roughly flat in question count');
 
 	const flat = results[2].ms < results[0].ms * 4 + 2000;
 	check('latency stays roughly flat to 200 questions', true, flat);
@@ -209,8 +266,14 @@ async function probeConsistency() {
 	record('score across 10 identical calls', `${distinct(scores)} distinct, spread ${spread(scores)}`, scores.join(' '));
 	record('noul across 10 identical calls', `${distinct(nouls)} distinct, spread ${spread(nouls)}`, nouls.join(' '));
 
-	// The package documents "consistent, not deterministic". Flag either extreme.
-	if (distinct(scores) === 1 && distinct(nouls) === 1) {
+	// Kev is near-deterministic: 10 sequential calls agreed exactly on 2026-09-28,
+	// and 12 parallel ones spread 0.0027 (the server batches concurrent requests).
+	// Flag only a Kev that got noisy.
+	if (GATEWAY) {
+		check('consistency claim (Kev)', 'spread under 0.01', spread(scores) < 0.01 && spread(nouls) < 0.01 ? 'spread under 0.01' : `score ${spread(scores)}, noul ${spread(nouls)}`,
+			'Kev is near-deterministic; cache still defaults to false so sample() and the typesafe provider behave the same');
+	} else if (distinct(scores) === 1 && distinct(nouls) === 1) {
+		// The package documents "consistent, not deterministic". Flag either extreme.
 		findings.push({
 			name: 'consistency claim',
 			expected: 'consistent but not deterministic',
@@ -259,10 +322,11 @@ async function main() {
 		}
 	}
 
-	const cost = (inputTokens / 1e6) * MODEL_PRICING['jev-1.13.0'].input;
+	// Two probe requests send `gpt-9` and no model at all; everything else sends MODEL.
+	const cost = computeCost({ inputTokens, outputTokens: 0 }, MODEL) ?? 0;
 
 	if (JSON_OUT) {
-		console.log(JSON.stringify({ findings, requests, inputTokens, cost, pricingAsOf: MODEL_PRICING_AS_OF }, null, 2));
+		console.log(JSON.stringify({ provider: PROVIDER.name, model: MODEL, findings, requests, inputTokens, cost, keySpend, pricingAsOf: MODEL_PRICING_AS_OF }, null, 2));
 	} else {
 		console.log('');
 		for (const f of findings) {
@@ -278,7 +342,8 @@ async function main() {
 		}
 		const failed = findings.filter((f) => !f.ok).length;
 		console.log(`\n${findings.length - failed} matched, ${failed} differed`);
-		console.log(`${requests} requests, ${inputTokens} input tokens, $${cost.toFixed(6)}`);
+		console.log(`${PROVIDER.name} / ${MODEL}: ${requests} requests, ${inputTokens} input tokens, $${cost.toFixed(6)}`);
+		if (keySpend !== undefined) console.log(`gateway key spend $${keySpend} (settles late; lags this run)`);
 		if (failed > 0) console.log('\nUpdate models.js, tokens.js and AGENTS.md before shipping.');
 	}
 

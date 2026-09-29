@@ -54,6 +54,11 @@ __export(errors_exports, {
 });
 function describeDetail(body, status) {
   const detail = body?.detail;
+  if (detail === void 0 && body?.error && typeof body.error === "object") {
+    const errorType = typeof body.error.type === "string" ? body.error.type : void 0;
+    const message = typeof body.error.message === "string" && body.error.message ? body.error.message : `HTTP ${status}`;
+    return { message, errorType, fields: [] };
+  }
   if (Array.isArray(detail)) {
     const fields = detail.map((d) => ({
       // `loc` starts with "body"; drop it, it is the same for every entry.
@@ -74,12 +79,18 @@ function describeDetail(body, status) {
   const fallback = typeof body === "string" && body ? body.slice(0, 300) : `HTTP ${status}`;
   return { message: fallback, errorType: void 0, fields: [] };
 }
-function errorFromResponse({ status, body, headers, requestId }) {
+function errorFromResponse({ status, body, headers, requestId, keyEnv = "TYPESAFE_API_KEY" }) {
   const { message, errorType, fields } = describeDetail(body, status);
-  const meta = { status, detail: body?.detail, errorType, requestId, headers };
+  const meta = { status, detail: body?.detail ?? body?.error, errorType, requestId, headers };
   if (status === 401) {
     return new JevAuthError(
-      `${message} Set TYPESAFE_API_KEY, or pass { apiKey } to the constructor.`,
+      `${message} Set ${keyEnv}, or pass { apiKey } to the constructor.`,
+      meta
+    );
+  }
+  if (status === 422 && typeof body?.detail === "string" && /branch too long/.test(body.detail)) {
+    return new JevRequestTooLargeError(
+      `${message}. The state plus the single longest question must fit the model's row limit. Filter the state down to what the questions actually need. Call estimate() to check before sending.`,
       meta
     );
   }
@@ -213,6 +224,7 @@ __export(index_exports, {
   Classifier: () => classifier_default,
   DEFAULT_BASE_URL: () => DEFAULT_BASE_URL,
   DEFAULT_MODEL: () => DEFAULT_MODEL,
+  DEFAULT_PROVIDER: () => DEFAULT_PROVIDER,
   DEFAULT_RETRY: () => DEFAULT_RETRY,
   DEFAULT_THRESHOLDS: () => DEFAULT_THRESHOLDS,
   DEFAULT_TIMEOUT_MS: () => DEFAULT_TIMEOUT_MS,
@@ -240,12 +252,14 @@ __export(index_exports, {
   JevTimeoutError: () => JevTimeoutError,
   JevUnprocessableError: () => JevUnprocessableError,
   JevValidationError: () => JevValidationError,
+  LITELLM_DEFAULT_ROOT: () => LITELLM_DEFAULT_ROOT,
   MODELS_PATH: () => MODELS_PATH,
   MODEL_ALIASES: () => MODEL_ALIASES,
   MODEL_LIMITS: () => MODEL_LIMITS,
   MODEL_PRICING: () => MODEL_PRICING,
   MODEL_PRICING_AS_OF: () => MODEL_PRICING_AS_OF,
   NOT_STATED: () => NOT_STATED,
+  PROVIDERS: () => PROVIDERS,
   QUESTION_META: () => QUESTION_META,
   QUESTION_TYPES: () => QUESTION_TYPES,
   Ranker: () => ranker_default,
@@ -271,6 +285,7 @@ __export(index_exports, {
   estimateRequest: () => estimateRequest,
   estimateTokens: () => estimateTokens,
   expandQuestions: () => expandQuestions,
+  gatewayMeta: () => gatewayMeta,
   listModels: () => listModels,
   log: () => logger_default,
   models: () => models,
@@ -285,6 +300,7 @@ __export(index_exports, {
   resolveLimits: () => resolveLimits,
   resolveModelId: () => resolveModelId,
   resolvePricing: () => resolvePricing,
+  resolveProvider: () => resolveProvider,
   sample: () => sample,
   score: () => score,
   sleep: () => sleep,
@@ -303,11 +319,59 @@ init_errors();
 init_errors();
 var DEFAULT_MODEL = "jev-latest";
 var DEFAULT_BASE_URL = "https://api.typesafe.ai";
+var LITELLM_DEFAULT_ROOT = "https://litellm.mixpanel.org";
+var PROVIDERS = Object.freeze({
+  typesafe: Object.freeze({
+    name: "typesafe",
+    keyEnv: Object.freeze(["TYPESAFE_API_KEY", "JEV_API_KEY"]),
+    keyHelp: "Get a key at https://console.typesafe.ai/keys",
+    baseURL: () => process.env.TYPESAFE_BASE_URL ?? DEFAULT_BASE_URL,
+    defaultModel: () => process.env.TYPESAFE_DEFAULT_MODEL ?? DEFAULT_MODEL,
+    limitsModel: void 0,
+    timeout: void 0
+  }),
+  litellm: Object.freeze({
+    name: "litellm",
+    keyEnv: Object.freeze(["LITELLM_API_KEY"]),
+    keyHelp: "Create one at https://litellm.mixpanel.org: Virtual Keys, Create Key, team general or sales",
+    // Same LITELLM_BASE_URL as ak-litellm, which may or may not end in /v1.
+    baseURL: () => `${(process.env.LITELLM_BASE_URL ?? LITELLM_DEFAULT_ROOT).replace(/\/+$/, "").replace(/\/v1$/, "")}/typesafe`,
+    defaultModel: () => "kev-latest",
+    limitsModel: "kev-latest",
+    // Kev's latency grows with question count (1,000 questions: 30 s), where
+    // Jev's stays near flat. Jev's 30 s default would time out large requests.
+    timeout: 12e4
+  })
+});
+var DEFAULT_PROVIDER = "typesafe";
+function resolveProvider(name) {
+  const id = name ?? process.env.JEV_PROVIDER ?? DEFAULT_PROVIDER;
+  const spec = PROVIDERS[id];
+  if (!spec) {
+    throw new JevConfigError(
+      `Unknown provider "${id}". Valid providers are: ${Object.keys(PROVIDERS).join(", ")}.`
+    );
+  }
+  return {
+    name: spec.name,
+    baseURL: spec.baseURL().replace(/\/+$/, ""),
+    defaultModel: spec.defaultModel(),
+    apiKey: spec.keyEnv.map((k) => process.env[k]).find(Boolean),
+    keyEnv: spec.keyEnv,
+    keyHelp: spec.keyHelp,
+    limitsModel: spec.limitsModel,
+    timeout: spec.timeout
+  };
+}
 var SYSTEM_ONE_PATH = "/v1/systemone";
 var MODELS_PATH = "/v1/models";
 var MODEL_PRICING_AS_OF = "2026-09-21";
 var MODEL_PRICING = Object.freeze({
-  "jev-1.13.0": { input: 0.042, output: 0 }
+  "jev-1.13.0": { input: 0.042, output: 0 },
+  // Mixpanel's self-hosted Kev, on the litellm provider only. Free: the gateway's
+  // key spend does not move for it, while a `jev-*` name on the same route is
+  // billed at the rate above. Measured 2026-09-28.
+  "kev-latest": { input: 0, output: 0 }
 });
 var MODEL_ALIASES = Object.freeze({
   "jev-latest": "jev-1.13.0",
@@ -342,6 +406,41 @@ var MODEL_LIMITS = Object.freeze({
      * 267 input tokens before any of your own content.
      */
     requestOverheadTokens: 267
+  }),
+  /**
+   * Kev (`jaredpalmer/kev-4b`) behind the litellm provider. Measured against the
+   * gateway on 2026-09-28. It is a different model from Jev and its limits are
+   * different in both directions.
+   */
+  "kev-latest": Object.freeze({
+    /**
+     * No total limit found: 8,000 questions over one state (226,822 input
+     * tokens) was accepted. This is the largest size measured, not a known
+     * ceiling. Latency grows with question count on Kev (1,000 questions took
+     * 30 s), so a request this large is slow long before it is rejected.
+     */
+    contextTokens: 22e4,
+    /**
+     * `422 branch too long: <n> tokens with a <m>-token state (row limit 8192)`.
+     * Accepted at 8,187 input tokens with one short question.
+     */
+    stateTokens: 8192,
+    /** 256 options is a 422 validation array, not Jev's 400 string. */
+    maxChoiceOptions: 255,
+    /** An empty choice is a 422. */
+    minChoiceOptions: 1,
+    /** Up to 255 levels accepted; 256 is a 422. Jev stops at 10. */
+    maxScoreLevels: 255,
+    /** Accepted, with the same `score: 0, confidence: 1` as Jev. */
+    minScoreLevels: 1,
+    /**
+     * Not published. 60 concurrent requests all returned 200. These mirror
+     * Jev's published figures so the client-side governor defaults still fit.
+     */
+    requestsPerMinute: 1200,
+    tokensPerSecond: 25e4,
+    /** Empty state, one-character question: 10 input tokens. */
+    requestOverheadTokens: 10
   })
 });
 function resolveModelId(model) {
@@ -354,8 +453,9 @@ function resolvePricing(model) {
   if (!rates) return null;
   return { ...rates, asOf: MODEL_PRICING_AS_OF, modelId };
 }
-function resolveLimits(model) {
-  const modelId = resolveModelId(model);
+function resolveLimits(model, provider) {
+  const limitsModel = typeof provider === "string" ? PROVIDERS[provider]?.limitsModel : provider?.limitsModel;
+  const modelId = resolveModelId(limitsModel ?? model);
   return MODEL_LIMITS[modelId] ?? MODEL_LIMITS["jev-1.13.0"];
 }
 function computeCost(usage, model) {
@@ -366,13 +466,14 @@ function computeCost(usage, model) {
   return input + output;
 }
 async function listModels(opts = {}) {
-  const apiKey = opts.apiKey ?? process.env.TYPESAFE_API_KEY ?? process.env.JEV_API_KEY;
+  const provider = resolveProvider(opts.provider);
+  const apiKey = opts.apiKey ?? provider.apiKey;
   if (!apiKey) {
     throw new JevValidationError(
-      "listModels() needs an API key. Pass { apiKey } or set TYPESAFE_API_KEY."
+      `listModels() needs an API key. Pass { apiKey } or set ${provider.keyEnv[0]}.`
     );
   }
-  const baseURL = (opts.baseURL ?? process.env.TYPESAFE_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+  const baseURL = (opts.baseURL ?? provider.baseURL).replace(/\/+$/, "");
   const doFetch = opts.fetch ?? globalThis.fetch;
   const res = await doFetch(`${baseURL}${MODELS_PATH}`, {
     method: "GET",
@@ -386,7 +487,8 @@ async function listModels(opts = {}) {
       status: res.status,
       body,
       headers: Object.fromEntries(res.headers),
-      requestId: res.headers.get("x-typesafe-request-id") ?? void 0
+      requestId: res.headers.get("x-typesafe-request-id") ?? void 0,
+      keyEnv: provider.keyEnv[0]
     });
   }
   return body?.models ?? [];
@@ -578,8 +680,10 @@ var DEFAULT_TIMEOUT_MS = 3e4;
 var JevClient = class {
   /**
    * @param {Object} [config={}]
-   * @param {string} [config.apiKey] falls back to `TYPESAFE_API_KEY`, then `JEV_API_KEY`
-   * @param {string} [config.baseURL] falls back to `TYPESAFE_BASE_URL`, then the public API
+   * @param {string} [config.provider] `typesafe` or `litellm`; falls back to `JEV_PROVIDER`
+   * @param {string} [config.apiKey] falls back to the provider's key variable
+   *   (`TYPESAFE_API_KEY` then `JEV_API_KEY`, or `LITELLM_API_KEY`)
+   * @param {string} [config.baseURL] falls back to the provider's base URL
    * @param {number} [config.timeout] per attempt, ms
    * @param {Partial<typeof DEFAULT_RETRY>} [config.retry]
    * @param {Object.<string,string>} [config.defaultHeaders]
@@ -588,15 +692,18 @@ var JevClient = class {
    * @param {string} [config.userAgent]
    */
   constructor(config = {}) {
-    const apiKey = config.apiKey ?? process.env.TYPESAFE_API_KEY ?? process.env.JEV_API_KEY;
+    const provider = resolveProvider(config.provider);
+    const apiKey = config.apiKey ?? provider.apiKey;
     if (!apiKey) {
       throw new JevConfigError(
-        "No API key. Pass { apiKey } to the constructor, or set TYPESAFE_API_KEY in the environment. Get a key at https://console.typesafe.ai/keys"
+        `No API key. Pass { apiKey } to the constructor, or set ${provider.keyEnv[0]} in the environment. ${provider.keyHelp}`
       );
     }
+    this.provider = provider.name;
+    this.keyEnv = provider.keyEnv[0];
     this.apiKey = apiKey;
-    this.baseURL = (config.baseURL ?? process.env.TYPESAFE_BASE_URL ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
-    this.timeout = config.timeout ?? DEFAULT_TIMEOUT_MS;
+    this.baseURL = (config.baseURL ?? provider.baseURL).replace(/\/+$/, "");
+    this.timeout = config.timeout ?? provider.timeout ?? DEFAULT_TIMEOUT_MS;
     this.retry = { ...DEFAULT_RETRY, ...config.retry ?? {} };
     this.defaultHeaders = { ...config.defaultHeaders ?? {} };
     this.fetch = config.fetch ?? globalThis.fetch;
@@ -733,7 +840,13 @@ var JevClient = class {
       }
     }
     if (!res.ok) {
-      throw errorFromResponse({ status: res.status, body: data, headers: responseHeaders, requestId });
+      throw errorFromResponse({
+        status: res.status,
+        body: data,
+        headers: responseHeaders,
+        requestId,
+        keyEnv: this.keyEnv
+      });
     }
     return { data, requestId, status: res.status, headers: responseHeaders, latencyMs };
   }
@@ -750,6 +863,20 @@ function backoffDelay(err, attempt, retry) {
   }
   const base = Math.min(retry.backoffInitialMs * 2 ** attempt, retry.backoffMaxMs);
   return Math.max(0, base * (1 - Math.random() * retry.backoffJitter));
+}
+function gatewayMeta(headers = {}) {
+  const num = (name) => {
+    if (headers[name] === void 0 || headers[name] === "") return void 0;
+    const n = Number(headers[name]);
+    return Number.isFinite(n) ? n : void 0;
+  };
+  const out = {};
+  const responseCost = num("x-litellm-response-cost");
+  if (responseCost !== void 0) out.responseCost = responseCost;
+  if (headers["x-litellm-call-id"]) out.callId = headers["x-litellm-call-id"];
+  const keySpend = num("x-litellm-key-spend");
+  if (keySpend !== void 0) out.keySpend = keySpend;
+  return out;
 }
 
 // cache.js
@@ -1262,6 +1389,8 @@ var BaseJev = class {
   constructor(options = {}) {
     const o = normalizeOptions(options);
     this.modelName = o.modelName;
+    this.provider = o.provider.name;
+    this._providerLimitsModel = o.provider.limitsModel;
     this.baseURL = o.baseURL;
     this.thresholds = o.thresholds;
     this.validate = o.validate;
@@ -1276,6 +1405,7 @@ var BaseJev = class {
     });
     this.cache = resolveCache(o.cache);
     this.client = new JevClient({
+      provider: o.provider.name,
       apiKey: o.apiKey,
       baseURL: o.baseURL,
       timeout: o.timeout,
@@ -1350,7 +1480,7 @@ var BaseJev = class {
       }
       this._cacheMisses++;
     }
-    const { data, requestId, latencyMs } = await this.client.systemOne(body, {
+    const { data, requestId, latencyMs, headers } = await this.client.systemOne(body, {
       signal: opts.signal,
       timeout: opts.timeout,
       retry: opts.retry,
@@ -1363,7 +1493,8 @@ var BaseJev = class {
       requestedModel: model,
       cached: false,
       latencyMs,
-      requestId
+      requestId,
+      gateway: gatewayMeta(headers)
     });
     this.onResult?.(result);
     return result;
@@ -1484,7 +1615,7 @@ var BaseJev = class {
     const expanded = expandQuestions(questions);
     const wire = toWireQuestions(expanded);
     const model = opts.model ?? this.modelName;
-    const est = estimateRequest({ state, questions: wire, model });
+    const est = estimateRequest({ state, questions: wire, model: this._limitsModel(model) });
     return {
       ...est,
       estimatedCost: computeCost({ inputTokens: est.totalTokens, outputTokens: 0 }, model)
@@ -1537,15 +1668,25 @@ var BaseJev = class {
       governor: this.governor.snapshot()
     };
   }
-  /** The hard limits for the configured model. */
+  /** The hard limits for the configured model on the configured provider. */
   limits() {
-    return resolveLimits(this.modelName);
+    return resolveLimits(this.modelName, this.provider);
   }
   /** Per-million-token rates for the configured model, or `null` if unknown. */
   pricing() {
     return resolvePricing(this.modelName);
   }
   // ── internals ─────────────────────────────────────────────────────────────
+  /**
+   * The model whose limits govern a request. On the litellm provider every name
+   * is served by Kev, so Kev's limits apply even to `jev-latest`.
+   *
+   * @param {string} model
+   * @returns {string}
+   */
+  _limitsModel(model) {
+    return this._providerLimitsModel ?? model;
+  }
   /**
    * Expand shorthand, validate against the API's hard limits, collect client-side
    * metadata, and estimate the request.
@@ -1559,7 +1700,7 @@ var BaseJev = class {
     const expanded = expandQuestions(questions);
     const model = opts.model ?? this.modelName;
     if (this.validate) {
-      const { warnings } = validateQuestions(expanded, { model });
+      const { warnings } = validateQuestions(expanded, { model: this._limitsModel(model) });
       for (const w of warnings) logger_default.warn(`ak-jev: ${w}`);
     }
     const meta = {};
@@ -1568,7 +1709,7 @@ var BaseJev = class {
       if (m.levelNames) meta[id] = m;
     }
     const wire = toWireQuestions(expanded);
-    const estimate2 = estimateRequest({ state, questions: wire, model });
+    const estimate2 = estimateRequest({ state, questions: wire, model: this._limitsModel(model) });
     if (this.checkBudget && !estimate2.withinBudget) {
       for (const w of estimate2.warnings) logger_default.warn(`ak-jev: ${w}`);
     }
@@ -1582,7 +1723,7 @@ var BaseJev = class {
    * @param {Object} ctx
    * @returns {JevResult}
    */
-  _buildResult(data, { prepared, requestedModel, cached, latencyMs, requestId }) {
+  _buildResult(data, { prepared, requestedModel, cached, latencyMs, requestId, gateway = {} }) {
     const answers = enrichAnswers(data?.answers ?? {}, {
       thresholds: this.thresholds,
       meta: prepared.meta
@@ -1590,20 +1731,24 @@ var BaseJev = class {
     const inputTokens = data?.usage?.input_tokens ?? 0;
     const outputTokens = data?.usage?.output_tokens ?? 0;
     const model = data?.model ?? requestedModel;
+    const gatewayCost = !cached && gateway.responseCost !== void 0;
     const usage = {
       inputTokens,
       outputTokens,
       totalTokens: inputTokens + outputTokens,
       // A cache hit costs nothing because no request was made. It is reported
       // as 0 with `cached: true`, never silently folded into the estimate.
-      estimatedCost: cached ? 0 : computeCost({ inputTokens, outputTokens }, model),
-      // This API returns no cost header, so every non-cached figure is a
-      // table estimate. Named for parity with the sibling packages.
-      costSource: cached ? "cached" : "estimated",
+      estimatedCost: cached ? 0 : gatewayCost ? (
+        /** @type {number} */
+        gateway.responseCost
+      ) : computeCost({ inputTokens, outputTokens }, model),
+      costSource: cached ? "cached" : gatewayCost ? "gateway" : "estimated",
       requests: cached ? 0 : 1,
       cached,
       questions: prepared.estimate.questionCount
     };
+    if (gateway.callId) usage.callId = gateway.callId;
+    if (gateway.keySpend !== void 0) usage.keySpend = gateway.keySpend;
     this._lastUsage = usage;
     accumulate(this._totalUsage, usage);
     return {
@@ -1618,7 +1763,8 @@ var BaseJev = class {
   }
 };
 function normalizeOptions(raw = {}) {
-  const modelName = raw.modelName ?? raw.model ?? process.env.TYPESAFE_DEFAULT_MODEL ?? DEFAULT_MODEL;
+  const provider = resolveProvider(raw.provider);
+  const modelName = raw.modelName ?? raw.model ?? provider.defaultModel;
   if (raw.thresholds) {
     for (const k of Object.keys(raw.thresholds)) {
       if (!["yes", "high", "low"].includes(k)) {
@@ -1629,9 +1775,10 @@ function normalizeOptions(raw = {}) {
     }
   }
   return {
+    provider,
     modelName,
     apiKey: raw.apiKey,
-    baseURL: (raw.baseURL ?? process.env.TYPESAFE_BASE_URL ?? "https://api.typesafe.ai").replace(/\/+$/, ""),
+    baseURL: (raw.baseURL ?? provider.baseURL).replace(/\/+$/, ""),
     timeout: raw.timeout,
     retry: raw.retry,
     defaultHeaders: raw.defaultHeaders,
@@ -1717,6 +1864,7 @@ function accumulate(total, one) {
   total.totalTokens += one.totalTokens;
   total.requests += one.requests;
   total.questions += one.questions;
+  if (one.keySpend !== void 0) total.keySpend = one.keySpend;
   if (one.estimatedCost !== null && total.estimatedCost !== null) {
     total.estimatedCost += one.estimatedCost;
   } else {
@@ -3098,9 +3246,10 @@ async function models(opts = {}) {
   return client(opts).listModels();
 }
 function estimate(state, questions, opts = {}) {
-  const model = opts.model ?? process.env.TYPESAFE_DEFAULT_MODEL ?? DEFAULT_MODEL;
+  const provider = resolveProvider(opts.provider);
+  const model = opts.model ?? provider.defaultModel;
   const wire = toWireQuestions(expandQuestions(questions));
-  const est = estimateRequest({ state, questions: wire, model });
+  const est = estimateRequest({ state, questions: wire, model: provider.limitsModel ?? model });
   return {
     ...est,
     estimatedCost: computeCost({ inputTokens: est.totalTokens, outputTokens: 0 }, model)
@@ -3133,6 +3282,7 @@ var index_default = {
   Classifier,
   DEFAULT_BASE_URL,
   DEFAULT_MODEL,
+  DEFAULT_PROVIDER,
   DEFAULT_RETRY,
   DEFAULT_THRESHOLDS,
   DEFAULT_TIMEOUT_MS,
@@ -3160,12 +3310,14 @@ var index_default = {
   JevTimeoutError,
   JevUnprocessableError,
   JevValidationError,
+  LITELLM_DEFAULT_ROOT,
   MODELS_PATH,
   MODEL_ALIASES,
   MODEL_LIMITS,
   MODEL_PRICING,
   MODEL_PRICING_AS_OF,
   NOT_STATED,
+  PROVIDERS,
   QUESTION_META,
   QUESTION_TYPES,
   Ranker,
@@ -3190,6 +3342,7 @@ var index_default = {
   estimateRequest,
   estimateTokens,
   expandQuestions,
+  gatewayMeta,
   listModels,
   log,
   models,
@@ -3204,6 +3357,7 @@ var index_default = {
   resolveLimits,
   resolveModelId,
   resolvePricing,
+  resolveProvider,
   sample,
   score,
   sleep,

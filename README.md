@@ -49,6 +49,100 @@ TYPESAFE_API_KEY=apikey_...
 
 Get one at [console.typesafe.ai/keys](https://console.typesafe.ai/keys).
 
+At Mixpanel, you can skip the TypeSafe key and use the LiteLLM gateway instead.
+See [the next section](#mixpanels-litellm-gateway-kev).
+
+---
+
+## Mixpanel's LiteLLM gateway (Kev)
+
+Mixpanel's LiteLLM gateway has a pass-through route to **Kev**, a self-hosted,
+open-weight System One model ([`jaredpalmer/kev-4b`](https://huggingface.co/jaredpalmer/kev-4b),
+a LoRA on Qwen3.5-4B-Base). Kev speaks the same `/v1/systemone` protocol as Jev.
+Every class, builder and helper in this package works on it unchanged.
+
+**1. Get a key.** Open [litellm.mixpanel.org](https://litellm.mixpanel.org), go to
+**Virtual Keys**, then **Create Key**. Pick team `general` or `sales` and the default
+models. Kev is not in the gateway's model list or playground, because it is a
+pass-through route, not a model. Your calls show on the **Logs** page as
+`typesafe/kev-latest`.
+
+**2. Point ak-jev at the gateway.** Two lines in `.env`, and no code changes:
+
+```bash
+JEV_PROVIDER=litellm
+LITELLM_API_KEY=sk-...
+```
+
+Or choose per instance, which wins over `JEV_PROVIDER`:
+
+```javascript
+const triage = new Evaluator({ provider: 'litellm', questions });
+```
+
+`LITELLM_API_KEY` and `LITELLM_BASE_URL` are the same variables ak-litellm reads.
+Each provider reads only its own variables, so a `TYPESAFE_BASE_URL` in the same
+`.env` cannot send your gateway key to TypeSafe.
+
+| | `provider: 'typesafe'` (default) | `provider: 'litellm'` |
+|---|---|---|
+| Key | `TYPESAFE_API_KEY` or `JEV_API_KEY` | `LITELLM_API_KEY` |
+| Base URL | `TYPESAFE_BASE_URL`, else `https://api.typesafe.ai` | `LITELLM_BASE_URL` + `/typesafe`, else `https://litellm.mixpanel.org/typesafe` |
+| Default model | `TYPESAFE_DEFAULT_MODEL`, else `jev-latest` | `kev-latest` |
+| Per-attempt timeout | 30 s | 120 s |
+
+An explicit `apiKey`, `baseURL`, `modelName` or `timeout` option always wins.
+
+**Use `kev-latest`.** It is free. The gateway also accepts `jev-latest`, but it
+bills that name at TypeSafe's rate ($0.042/Mtok), and the gateway serves it from
+the same Kev server. The gateway answers **every** model name from Kev.
+
+### Kev is not Jev
+
+Kev is a different and much smaller model. Do not reuse thresholds you tuned on Jev
+without checking them. ak-jev knows these differences and applies Kev's limits to
+every request on the litellm provider, whatever model name you send:
+
+| | Jev (typesafe) | Kev (litellm) |
+|---|---|---|
+| State + the single longest question | 32,000 tokens | **8,192 tokens** |
+| Total tokens per request | 64,000 | no limit found up to 226,822 |
+| Score levels | 10 | 255 |
+| Choice options | 255 | 255 |
+| Fixed request overhead | 267 tokens | 10 tokens |
+| Latency | near flat: 500 questions in ~0.5 s | grows with question count: 1,000 questions in ~30 s |
+| Repeat the same request | spreads ~0.08 | near-deterministic: identical when sequential, ~0.003 when parallel |
+| Price | $0.042/Mtok input | free |
+| Over the state limit | 400 `max_tokens_exceeded` | 422 `branch too long` |
+
+Both oversize errors become `JevRequestTooLargeError`. A bad gateway key comes back
+in LiteLLM's own `{"error": {...}}` shape. ak-jev reads that shape too, and the
+`JevAuthError` names `LITELLM_API_KEY`. Measured 2026-09-28. Run
+`npm run probe-api:litellm` to measure again.
+
+### Usage and spend on the gateway
+
+```javascript
+const { usage } = await triage.run(ticket);
+usage.inputTokens     // 81
+usage.outputTokens    // 177
+usage.estimatedCost   // 0          kev-latest is free
+usage.costSource      // 'estimated'
+usage.callId          // 'bfa9faa7-…'   x-litellm-call-id, matches the gateway's Logs page
+usage.keySpend        // 0.000018984    x-litellm-key-spend
+```
+
+- `keySpend` is the key's **cumulative** USD, as of the gateway's last update. The
+  gateway updates it late, often by a minute or more. It is never the cost of this
+  call.
+- If the gateway ever sends `x-litellm-response-cost`, ak-jev uses that exact figure
+  and sets `costSource: 'gateway'`. The gateway did not send it on 2026-09-28.
+- `getTotalUsage().keySpend` holds the latest figure seen. `callId` and `keySpend`
+  are not present on the typesafe provider.
+
+The CLI takes the same switch: `ak-jev ask --provider litellm ...`. The CLI also
+reads `JEV_PROVIDER`.
+
 ---
 
 ## Which one do I use?
@@ -725,6 +819,9 @@ costs a round trip and does not say which question caused it:
 | State + the single longest question | **32,000** ← the one you actually hit |
 | Rate limits | 1,200 req/min, 250,000 tokens/sec |
 
+Those are Jev's limits. Kev, on Mixpanel's gateway, has different ones. See
+[Kev is not Jev](#kev-is-not-jev).
+
 `estimateCost()` errs within about ±25% on realistic content; the budget check pads
 a further 25% on top, because chars-per-token varies from 3.5 (code) to 4.9 (legal
 prose). See [AGENTS.md](AGENTS.md#token-estimation) for the calibration table.
@@ -845,6 +942,7 @@ cat ticket.txt | ak-jev ask --questions triage.json --json
 ak-jev estimate --file contract.txt --questions checks.json
 ak-jev models
 ak-jev limits
+ak-jev ask --provider litellm "My card was charged twice" --noul "Is this about billing?"
 ```
 
 ---
@@ -885,10 +983,11 @@ another model's output.
 ## Development
 
 ```bash
-npm test              # 216 offline tests, ~1.3s, no network, free
-npm run test:live     # real API, ~30 tests, about $0.0003
+npm test                   # 332 offline tests, ~1.5s, no network, free
+npm run test:live          # real API, 37 tests, about $0.0003; the Kev tests run when LITELLM_API_KEY is set
 npm run typecheck
-npm run probe-api     # re-derive every measured fact and diff it
+npm run probe-api          # re-derive every measured fact and diff it
+npm run probe-api:litellm  # the same, against Kev on the gateway; free
 npm run build:cjs
 ```
 

@@ -66,6 +66,10 @@ export {
 	MODEL_LIMITS,
 	DEFAULT_MODEL,
 	DEFAULT_BASE_URL,
+	LITELLM_DEFAULT_ROOT,
+	PROVIDERS,
+	DEFAULT_PROVIDER,
+	resolveProvider,
 	SYSTEM_ONE_PATH,
 	MODELS_PATH,
 	resolveModelId,
@@ -84,7 +88,7 @@ export {
 } from './tokens.js';
 
 // ── Transport, cache, governor — exported for tests and for advanced callers ──
-export { JevClient, DEFAULT_RETRY, DEFAULT_TIMEOUT_MS, backoffDelay } from './client.js';
+export { JevClient, DEFAULT_RETRY, DEFAULT_TIMEOUT_MS, backoffDelay, gatewayMeta } from './client.js';
 export { ResponseCache, resolveCache, cacheKey, canonicalize } from './cache.js';
 export { Governor, sleep } from './governor.js';
 
@@ -118,7 +122,7 @@ export { NOT_STATED } from './extractor.js';
 export { default as log } from './logger.js';
 
 import BaseJev from './base.js';
-import { DEFAULT_MODEL, computeCost } from './models.js';
+import { computeCost, resolveProvider } from './models.js';
 import { expandQuestions, toWireQuestions } from './questions.js';
 import { estimateRequest } from './tokens.js';
 import Evaluator from './evaluator.js';
@@ -200,7 +204,7 @@ export async function models(opts = {}) {
  *
  * @param {any} state
  * @param {Object.<string, any>} questions
- * @param {{model?: string}} [opts={}]
+ * @param {{model?: string, provider?: string}} [opts={}]
  * @returns {import('./tokens.js').JevEstimate & {estimatedCost: number|null}}
  *
  * @example
@@ -211,9 +215,10 @@ export async function models(opts = {}) {
  * console.log(`~$${(e.estimatedCost * corpus.length).toFixed(2)} for the whole corpus`);
  */
 export function estimate(state, questions, opts = {}) {
-	const model = opts.model ?? process.env.TYPESAFE_DEFAULT_MODEL ?? DEFAULT_MODEL;
+	const provider = resolveProvider(opts.provider);
+	const model = opts.model ?? provider.defaultModel;
 	const wire = toWireQuestions(expandQuestions(questions));
-	const est = estimateRequest({ state, questions: wire, model });
+	const est = estimateRequest({ state, questions: wire, model: provider.limitsModel ?? model });
 	return {
 		...est,
 		estimatedCost: computeCost({ inputTokens: est.totalTokens, outputTokens: 0 }, model)

@@ -2,7 +2,7 @@
 	"name": "ak-jev",
 	"author": "ak@mixpanel.com",
 	"description": "AK's wrapper for TypeSafe's Jev — the System One model. Typed decisions, probabilities and confidence for Node.js.",
-	"version": "0.1.0",
+	"version": "0.2.0",
 	"main": "index.js",
 	"files": [
 		".env.example",
@@ -73,7 +73,8 @@
 		"coverage": "node --no-warnings --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
 		"build:cjs": "esbuild index.js --bundle --platform=node --format=cjs --outfile=index.cjs --external:dotenv --external:pino --external:pino-pretty",
 		"typecheck": "tsc --noEmit",
-		"probe-api": "node scripts/probe-api.mjs"
+		"probe-api": "node scripts/probe-api.mjs",
+		"probe-api:litellm": "node scripts/probe-api.mjs --provider litellm"
 	},
 	"type": "module",
 	"keywords": [

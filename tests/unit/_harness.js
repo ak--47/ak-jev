@@ -7,6 +7,19 @@
  * quietly calling the real API.
  */
 
+/** @type {{urlPrefix: string, authorization: string}|null} */
+let expected = null;
+
+/**
+ * Make every fake `fetch` refuse a request that does not go to `urlPrefix` with
+ * `authorization`. Pass `null` to turn the check off.
+ *
+ * @param {{urlPrefix: string, authorization: string}|null} transport
+ */
+export function expectTransport(transport) {
+	expected = transport;
+}
+
 /**
  * Build a fake `fetch` that returns canned responses.
  *
@@ -21,6 +34,14 @@ export function fakeFetch(script) {
 	let n = 0;
 
 	const impl = async (/** @type {string} */ url, /** @type {any} */ init = {}) => {
+		if (expected) {
+			// Fail the request, not just an assertion, so no class can pass while
+			// talking to the wrong provider.
+			if (!url.startsWith(expected.urlPrefix)) throw new Error(`expected a request to ${expected.urlPrefix}, got ${url}`);
+			if (init.headers?.Authorization !== expected.authorization) {
+				throw new Error(`expected Authorization "${expected.authorization}", got "${init.headers?.Authorization}"`);
+			}
+		}
 		const body = init.body ? JSON.parse(init.body) : undefined;
 		const index = n++;
 		calls.push({ url, init, body });
@@ -121,3 +142,31 @@ export const OFFLINE = Object.freeze({
 	logLevel: 'silent',
 	cache: false
 });
+
+/**
+ * The same, on the litellm provider. No `apiKey` or `baseURL`: the provider
+ * resolves them from `LITELLM_API_KEY` and `LITELLM_BASE_URL`, which
+ * `tests/jest.setup.js` points at fakes. That exercises the provider wiring too.
+ */
+export const OFFLINE_LITELLM = Object.freeze({
+	provider: 'litellm',
+	logLevel: 'silent',
+	cache: false
+});
+
+/**
+ * Both inference paths, for `describe.each`. `transport` is what every request
+ * on that path must look like.
+ */
+export const INFERENCE_PATHS = Object.freeze([
+	{
+		name: 'typesafe',
+		options: OFFLINE,
+		transport: { urlPrefix: 'https://api.typesafe.invalid/', authorization: 'Bearer apikey_test' }
+	},
+	{
+		name: 'litellm',
+		options: OFFLINE_LITELLM,
+		transport: { urlPrefix: 'https://litellm.invalid/typesafe/', authorization: 'Bearer sk-test-litellm' }
+	}
+]);

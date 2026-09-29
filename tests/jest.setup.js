@@ -12,6 +12,11 @@ if (process.env.JEV_LIVE === '1') {
 } else {
 	process.env.TYPESAFE_API_KEY = 'apikey_test_0000000000000000000000000000000000000000';
 	process.env.TYPESAFE_BASE_URL = 'https://api.typesafe.invalid';
+	// Same for the litellm provider. Set explicitly so dotenv cannot fill them in
+	// from a real .env, and so a JEV_PROVIDER there cannot switch the suite over.
+	process.env.LITELLM_API_KEY = 'sk-test-litellm';
+	process.env.LITELLM_BASE_URL = 'https://litellm.invalid';
+	process.env.JEV_PROVIDER = 'typesafe';
 	process.env.LOG_LEVEL = 'silent';
 }
 
