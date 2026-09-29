@@ -460,3 +460,54 @@ d('the classes, against the real model', () => {
 function sum(xs) {
 	return xs.reduce((a, b) => a + b, 0);
 }
+
+// ── litellm provider: Kev on Mixpanel's gateway ──────────────────────────────
+//
+// Also gated on JEV_LIVE=1, and skipped when LITELLM_API_KEY is not set, so a
+// TypeSafe-only checkout still runs the rest of the suite. kev-latest is free.
+// Facts measured 2026-09-28.
+
+const GW = LIVE && process.env.LITELLM_API_KEY ? describe : describe.skip;
+
+GW('litellm provider (Kev)', () => {
+	const opts = { provider: 'litellm', logLevel: 'silent', cache: false };
+
+	test('the classes run unchanged on the gateway, with kev-latest and gateway usage', async () => {
+		const ev = new Evaluator({
+			...opts,
+			questions: {
+				category: choice('What kind of ticket is this?', ['bug', 'billing', 'how_to']),
+				refund: noul('Is the customer asking for money back?')
+			}
+		});
+		const r = await ev.run('I was charged twice for my subscription this month. Please refund one of them.');
+		expect(r.model).toBe('kev-latest');
+		expect(r.answers.category.choice).toBe('billing');
+		expect(r.answers.refund.yes).toBe(true);
+		expect(r.usage.inputTokens).toBeGreaterThan(0);
+		expect(r.usage.estimatedCost).toBe(0);
+		expect(typeof r.usage.callId).toBe('string');
+		expect(typeof r.usage.keySpend).toBe('number');
+		expect(r.requestId).toBeDefined();
+	});
+
+	test('a bad gateway key is a JevAuthError that names LITELLM_API_KEY', async () => {
+		const bad = new BaseJev({ ...opts, apiKey: 'sk-definitely-not-a-key', retry: { maxRetries: 0 } });
+		const err = await bad.evaluate('x', { a: noul('y') }).catch((e) => e);
+		expect(err).toBeInstanceOf(JevAuthError);
+		expect(err.message).toMatch(/LITELLM_API_KEY/);
+	});
+
+	test('a state over the 8,192-token row limit is a JevRequestTooLargeError', async () => {
+		const filler = Array.from({ length: 600 }, (_, i) => `record ${i} alpha beta gamma delta epsilon ${i * 7} zeta eta theta iota kappa `).join('');
+		const k = new BaseJev({ ...opts, checkBudget: false, retry: { maxRetries: 0 } });
+		await expect(k.evaluate(filler, { a: noul('Does this mention GDPR?') })).rejects.toBeInstanceOf(JevRequestTooLargeError);
+	});
+
+	test('a 20-level score is accepted by Kev', async () => {
+		const k = new BaseJev(opts);
+		const levels = Array.from({ length: 20 }, (_, i) => `level ${i}`);
+		const r = await k.evaluate('A mildly annoyed customer.', { a: score('How annoyed?', levels) });
+		expect(r.answers.a.levels).toBe(20);
+	});
+});

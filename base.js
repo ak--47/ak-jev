@@ -9,7 +9,7 @@
 
 import 'dotenv/config';
 
-import { JevClient } from './client.js';
+import { JevClient, gatewayMeta } from './client.js';
 import { Governor } from './governor.js';
 import { ResponseCache, cacheKey, resolveCache } from './cache.js';
 import { enrichAnswers, DEFAULT_THRESHOLDS } from './answers.js';
@@ -21,10 +21,10 @@ import {
 } from './questions.js';
 import { estimateRequest } from './tokens.js';
 import {
-	DEFAULT_MODEL,
 	computeCost,
 	resolveLimits,
-	resolvePricing
+	resolvePricing,
+	resolveProvider
 } from './models.js';
 import { JevConfigError, JevValidationError } from './errors.js';
 import log from './logger.js';
@@ -42,6 +42,10 @@ class BaseJev {
 
 		/** @type {string} The model name sent on the wire. */
 		this.modelName = o.modelName;
+		/** @type {string} `typesafe` or `litellm` */
+		this.provider = o.provider.name;
+		/** @type {string|undefined} */
+		this._providerLimitsModel = o.provider.limitsModel;
 		/** @type {string} */
 		this.baseURL = o.baseURL;
 		/** @type {Required<import('./answers.js').JevThresholds>} */
@@ -69,6 +73,7 @@ class BaseJev {
 
 		/** @type {JevClient} */
 		this.client = new JevClient({
+			provider: o.provider.name,
 			apiKey: o.apiKey,
 			baseURL: o.baseURL,
 			timeout: o.timeout,
@@ -150,7 +155,7 @@ class BaseJev {
 			this._cacheMisses++;
 		}
 
-		const { data, requestId, latencyMs } = await this.client.systemOne(body, {
+		const { data, requestId, latencyMs, headers } = await this.client.systemOne(body, {
 			signal: opts.signal,
 			timeout: opts.timeout,
 			retry: opts.retry,
@@ -165,7 +170,8 @@ class BaseJev {
 			requestedModel: model,
 			cached: false,
 			latencyMs,
-			requestId
+			requestId,
+			gateway: gatewayMeta(headers)
 		});
 		this.onResult?.(result);
 		return result;
@@ -291,7 +297,7 @@ class BaseJev {
 		const expanded = expandQuestions(questions);
 		const wire = toWireQuestions(expanded);
 		const model = opts.model ?? this.modelName;
-		const est = estimateRequest({ state, questions: wire, model });
+		const est = estimateRequest({ state, questions: wire, model: this._limitsModel(model) });
 		return {
 			...est,
 			estimatedCost: computeCost({ inputTokens: est.totalTokens, outputTokens: 0 }, model)
@@ -350,9 +356,9 @@ class BaseJev {
 		};
 	}
 
-	/** The hard limits for the configured model. */
+	/** The hard limits for the configured model on the configured provider. */
 	limits() {
-		return resolveLimits(this.modelName);
+		return resolveLimits(this.modelName, this.provider);
 	}
 
 	/** Per-million-token rates for the configured model, or `null` if unknown. */
@@ -361,6 +367,17 @@ class BaseJev {
 	}
 
 	// ── internals ─────────────────────────────────────────────────────────────
+
+	/**
+	 * The model whose limits govern a request. On the litellm provider every name
+	 * is served by Kev, so Kev's limits apply even to `jev-latest`.
+	 *
+	 * @param {string} model
+	 * @returns {string}
+	 */
+	_limitsModel(model) {
+		return this._providerLimitsModel ?? model;
+	}
 
 	/**
 	 * Expand shorthand, validate against the API's hard limits, collect client-side
@@ -376,7 +393,7 @@ class BaseJev {
 		const model = opts.model ?? this.modelName;
 
 		if (this.validate) {
-			const { warnings } = validateQuestions(expanded, { model });
+			const { warnings } = validateQuestions(expanded, { model: this._limitsModel(model) });
 			for (const w of warnings) log.warn(`ak-jev: ${w}`);
 		}
 
@@ -388,7 +405,7 @@ class BaseJev {
 		}
 
 		const wire = toWireQuestions(expanded);
-		const estimate = estimateRequest({ state, questions: wire, model });
+		const estimate = estimateRequest({ state, questions: wire, model: this._limitsModel(model) });
 
 		if (this.checkBudget && !estimate.withinBudget) {
 			for (const w of estimate.warnings) log.warn(`ak-jev: ${w}`);
@@ -405,7 +422,7 @@ class BaseJev {
 	 * @param {Object} ctx
 	 * @returns {JevResult}
 	 */
-	_buildResult(data, { prepared, requestedModel, cached, latencyMs, requestId }) {
+	_buildResult(data, { prepared, requestedModel, cached, latencyMs, requestId, gateway = {} }) {
 		const answers = enrichAnswers(data?.answers ?? {}, {
 			thresholds: this.thresholds,
 			meta: prepared.meta
@@ -415,6 +432,11 @@ class BaseJev {
 		const outputTokens = data?.usage?.output_tokens ?? 0;
 		const model = data?.model ?? requestedModel;
 
+		// TypeSafe returns no cost header. The litellm gateway may send
+		// `x-litellm-response-cost`; when it does, that exact figure wins over the
+		// table. Named for parity with ak-litellm.
+		const gatewayCost = !cached && gateway.responseCost !== undefined;
+
 		/** @type {JevUsage} */
 		const usage = {
 			inputTokens,
@@ -422,14 +444,18 @@ class BaseJev {
 			totalTokens: inputTokens + outputTokens,
 			// A cache hit costs nothing because no request was made. It is reported
 			// as 0 with `cached: true`, never silently folded into the estimate.
-			estimatedCost: cached ? 0 : computeCost({ inputTokens, outputTokens }, model),
-			// This API returns no cost header, so every non-cached figure is a
-			// table estimate. Named for parity with the sibling packages.
-			costSource: cached ? 'cached' : 'estimated',
+			estimatedCost: cached
+				? 0
+				: gatewayCost
+					? /** @type {number} */ (gateway.responseCost)
+					: computeCost({ inputTokens, outputTokens }, model),
+			costSource: cached ? 'cached' : gatewayCost ? 'gateway' : 'estimated',
 			requests: cached ? 0 : 1,
 			cached,
 			questions: prepared.estimate.questionCount
 		};
+		if (gateway.callId) usage.callId = gateway.callId;
+		if (gateway.keySpend !== undefined) usage.keySpend = gateway.keySpend;
 
 		this._lastUsage = usage;
 		accumulate(this._totalUsage, usage);
@@ -453,7 +479,10 @@ class BaseJev {
 export function normalizeOptions(raw = {}) {
 	// `model` is what the API calls it; `modelName` is what the sibling packages
 	// call it. Accept both rather than make anyone remember which.
-	const modelName = raw.modelName ?? raw.model ?? process.env.TYPESAFE_DEFAULT_MODEL ?? DEFAULT_MODEL;
+	// Each provider brings its own key variable, base URL and default model. An
+	// explicit option always wins over the provider's default.
+	const provider = resolveProvider(raw.provider);
+	const modelName = raw.modelName ?? raw.model ?? provider.defaultModel;
 
 	if (raw.thresholds) {
 		for (const k of Object.keys(raw.thresholds)) {
@@ -466,9 +495,10 @@ export function normalizeOptions(raw = {}) {
 	}
 
 	return {
+		provider,
 		modelName,
 		apiKey: raw.apiKey,
-		baseURL: (raw.baseURL ?? process.env.TYPESAFE_BASE_URL ?? 'https://api.typesafe.ai').replace(/\/+$/, ''),
+		baseURL: (raw.baseURL ?? provider.baseURL).replace(/\/+$/, ''),
 		timeout: raw.timeout,
 		retry: raw.retry,
 		defaultHeaders: raw.defaultHeaders,
@@ -586,6 +616,8 @@ function accumulate(total, one) {
 	total.totalTokens += one.totalTokens;
 	total.requests += one.requests;
 	total.questions += one.questions;
+	// Cumulative on the key already, so the running total keeps the latest figure.
+	if (one.keySpend !== undefined) total.keySpend = one.keySpend;
 	if (one.estimatedCost !== null && total.estimatedCost !== null) {
 		total.estimatedCost += one.estimatedCost;
 	} else {
@@ -597,11 +629,15 @@ function accumulate(total, one) {
 
 /**
  * @typedef {Object} JevOptions
- * @property {string} [modelName='jev-latest'] also accepted as `model`
+ * @property {'typesafe'|'litellm'} [provider='typesafe'] where to send requests; falls back to
+ *   `JEV_PROVIDER`. `litellm` is Mixpanel's gateway, serving Kev
+ * @property {string} [modelName] also accepted as `model`; defaults to `jev-latest` on
+ *   typesafe and `kev-latest` on litellm
  * @property {string} [model]
- * @property {string} [apiKey] falls back to `TYPESAFE_API_KEY`
- * @property {string} [baseURL] falls back to `TYPESAFE_BASE_URL`
- * @property {number} [timeout=30000] per attempt, ms
+ * @property {string} [apiKey] falls back to `TYPESAFE_API_KEY` (typesafe) or `LITELLM_API_KEY` (litellm)
+ * @property {string} [baseURL] falls back to `TYPESAFE_BASE_URL` (typesafe) or
+ *   `LITELLM_BASE_URL` + `/typesafe` (litellm)
+ * @property {number} [timeout] per attempt, ms; 30000 on typesafe, 120000 on litellm
  * @property {Object} [retry] overrides for the retry policy
  * @property {Object.<string,string>} [defaultHeaders]
  * @property {typeof fetch} [fetch] custom transport, for tests or proxies
@@ -648,7 +684,11 @@ function accumulate(total, one) {
  * @property {number} outputTokens
  * @property {number} totalTokens
  * @property {number|null} estimatedCost USD; `null` means unknown, never free
- * @property {'estimated'|'cached'} costSource
+ * @property {'estimated'|'cached'|'gateway'} costSource `gateway` when the litellm gateway
+ *   sent `x-litellm-response-cost`
+ * @property {string} [callId] `x-litellm-call-id`, litellm provider only
+ * @property {number} [keySpend] `x-litellm-key-spend`: the key's cumulative USD as of the
+ *   gateway's last settle, which lags; litellm provider only
  * @property {number} requests API round trips; 0 for a cache hit
  * @property {boolean} cached
  * @property {number} questions

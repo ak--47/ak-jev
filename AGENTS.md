@@ -7,6 +7,11 @@ Guidance for Claude Code and other agents working in `ak-jev`.
 `ak-jev` wraps **TypeSafe's Jev**, the first System One model, at
 `POST https://api.typesafe.ai/v1/systemone`.
 
+Since 0.2.0 it also runs on **Mixpanel's LiteLLM gateway** (`provider: 'litellm'`
+or `JEV_PROVIDER=litellm`), a pass-through route to **Kev**, a self-hosted
+open-weight System One model on the same wire protocol. Kev is a different model
+with different limits. See section 11.
+
 Jev is not a chat model. One request carries a `state` and a map of typed
 `questions`; the response carries one typed `answer` per question. There is no
 generation, no conversation, no tool loop. The whole model surface is three
@@ -175,6 +180,46 @@ sibling packages. `output: 0` is real, not a rounding.
 `null` through the running total rather than summing a partial — reporting a
 partial sum as complete would understate spend.
 
+### 11. The litellm provider serves Kev, and Kev is not Jev
+
+`https://litellm.mixpanel.org/typesafe` forwards to a Kev server
+(`jaredpalmer/kev-4b`, a LoRA on Qwen3.5-4B-Base, served at temperature 2.41).
+It is a pass-through route, not a gateway model: it is absent from the gateway's
+model list and UI, and it logs as `typesafe/kev-latest`. Measured 2026-09-28;
+`npm run probe-api:litellm` re-derives it for free.
+
+- **Every model name is served by Kev.** `kev-latest`, `jev-latest`,
+  `jev-1.13.0`, `gpt-9` and a missing `model` all return 200 from the same server
+  (response header `x-litellm-model-api-base: http://kev.kev.svc…`). So
+  `PROVIDERS.litellm.limitsModel` forces Kev's limits for every name, and
+  `BaseJev._limitsModel()` passes it to validation and the budget check.
+- **Billing still follows the name.** `kev-latest` is free. `jev-latest` and
+  `jev-1.13.0` moved the key's spend by exactly $0.042/Mtok. That is two samples,
+  so treat it as observed, not proven.
+- **Limits:** state plus the longest question is **8,192** tokens (Jev: 32,000),
+  rejected as `422 {"detail":"branch too long: …(row limit 8192)"}`, which
+  `errorFromResponse()` maps to `JevRequestTooLargeError`. No total limit found up
+  to 226,822 input tokens. Score levels go to **255** (Jev: 10). 256 options or
+  levels is a 422 validation array, not a 400. Overhead is **10** tokens (Jev: 267).
+- **Kev accepts a Noul with neither `instructions` nor `criteria`.**
+  `validateQuestions()` still refuses it, so code stays portable to Jev.
+- **Latency grows with question count:** 1q ~0.2 s, 200q ~1.5 s, 1,000q ~30 s,
+  8,000q ~137 s. That is why litellm's default timeout is 120 s. 60 concurrent
+  requests all returned 200.
+- **Near-deterministic.** Ten sequential identical calls agreed exactly. Twelve
+  parallel calls spread 0.0027, because the server batches. `cache` still
+  defaults to `false`: the provider must not change the meaning of `sample()`.
+- **Gateway errors use LiteLLM's shape**, `{"error":{"message","type","code"}}`,
+  for a bad key (`token_not_found_in_db`) or no key (`auth_error`).
+  `describeDetail()` reads it as a fourth shape.
+- **Headers:** `x-typesafe-request-id` passes through. `x-litellm-call-id` and
+  `x-litellm-key-spend` are added and surface as `usage.callId` and
+  `usage.keySpend`. `x-litellm-response-cost` was **absent**. Key spend updates
+  asynchronously and lags by a minute or more, so it is never a per-call cost.
+- **Each provider reads only its own environment variables.** The real `.env`
+  holds `TYPESAFE_BASE_URL=https://api.typesafe.ai`. If the litellm provider
+  honored it, the gateway key would go to TypeSafe and fail with a 401.
+
 ---
 
 ## Architecture
@@ -183,10 +228,10 @@ partial sum as complete would understate spend.
 |---|---|
 | `base.js` | `BaseJev`. `evaluate`, `evaluateMany`, `sample`, usage, cost, cache, pre-flight. |
 | `client.js` | Transport on `fetch`: retry, timeout, governor hook, request-id capture. |
-| `errors.js` | Error classes; `describeDetail()` normalizes the three `detail` shapes. |
+| `errors.js` | Error classes; `describeDetail()` normalizes the three `detail` shapes and the gateway `error` shape. |
 | `questions.js` | `noul` / `choice` / `score`, shorthand expansion, limit validation. |
 | `answers.js` | Enrichment. Raw fields untouched; derived fields added. |
-| `models.js` | `MODEL_PRICING`, `MODEL_LIMITS`, aliases, `computeCost`, `listModels`. |
+| `models.js` | `PROVIDERS`, `resolveProvider`, `MODEL_PRICING`, `MODEL_LIMITS`, aliases, `computeCost`, `listModels`. |
 | `tokens.js` | Estimation and the two budget checks. |
 | `cache.js` | Canonical key, LRU, optional disk. Off by default. |
 | `governor.js` | Concurrency semaphore plus RPM and TPS sliding windows. |
@@ -233,11 +278,12 @@ BaseJev
 ## Commands
 
 ```bash
-npm test              # 216 offline tests, ~1.3s, no network, free
-npm run test:live     # JEV_LIVE=1, real API, ~30 tests, about $0.0003
-npm run typecheck     # tsc --noEmit
-npm run build:cjs     # esbuild → index.cjs
-npm run probe-api     # re-derive every measured fact, diff, exit 1 on drift
+npm test                   # 332 offline tests, ~1.5s, no network, free
+npm run test:live          # JEV_LIVE=1, real API, 37 tests, about $0.0003
+npm run typecheck          # tsc --noEmit
+npm run build:cjs          # esbuild → index.cjs
+npm run probe-api          # re-derive every measured fact, diff, exit 1 on drift
+npm run probe-api:litellm  # the same against Kev on the gateway; free
 node cli.js limits
 ```
 
@@ -249,13 +295,19 @@ Jest needs the ESM flags; `npm test` has them. Plain `npx jest` fails.
 
 ### Testing strategy
 
-**Unit (`tests/unit/`, 216 tests).** Fully offline. `tests/jest.setup.js` sets a
-fake key and points `TYPESAFE_BASE_URL` at `api.typesafe.invalid`, so a test that
-forgets to inject a `fetch` fails with DNS rather than quietly spending money.
+**Unit (`tests/unit/`, 332 tests).** Fully offline. `tests/jest.setup.js` sets
+fake keys, points `TYPESAFE_BASE_URL` at `api.typesafe.invalid` and
+`LITELLM_BASE_URL` at `litellm.invalid`, and pins `JEV_PROVIDER=typesafe`, so a
+test that forgets to inject a `fetch` fails with DNS rather than quietly spending
+money. `providers.test.js` covers the litellm provider. `classes.test.js` runs
+every class test on both providers (`INFERENCE_PATHS` in `_harness.js`), and
+`expectTransport()` makes the fake `fetch` refuse a request to the wrong URL or
+with the wrong key.
 `_harness.js` builds fake responses and honours `AbortSignal` so the timeout and
 abort paths are genuinely exercised.
 
-**Live (`tests/live/`, ~30 tests).** Gated on `JEV_LIVE=1`. Every assertion is an
+**Live (`tests/live/`, 37 tests).** Gated on `JEV_LIVE=1`. The four litellm tests
+also need `LITELLM_API_KEY` and skip without it. Every assertion is an
 upstream fact, not a claim about ak-jev, so drift breaks a test here before it
 breaks a consumer. Prints its own spend and asserts it stayed under a cent.
 
@@ -267,9 +319,12 @@ breaks a consumer. Prints its own spend and asserts it stayed under a cent.
 
 | variable | purpose |
 |---|---|
-| `TYPESAFE_API_KEY` | Required. Also accepted as `JEV_API_KEY`. |
-| `TYPESAFE_BASE_URL` | Optional. Defaults to `https://api.typesafe.ai`. |
-| `TYPESAFE_DEFAULT_MODEL` | Optional. Defaults to `jev-latest`. |
+| `JEV_PROVIDER` | Optional. `typesafe` (default) or `litellm`. The `provider` option wins. |
+| `TYPESAFE_API_KEY` | Required on typesafe. Also accepted as `JEV_API_KEY`. |
+| `TYPESAFE_BASE_URL` | Optional, typesafe only. Defaults to `https://api.typesafe.ai`. |
+| `TYPESAFE_DEFAULT_MODEL` | Optional, typesafe only. Defaults to `jev-latest`. |
+| `LITELLM_API_KEY` | Required on litellm. Same variable as ak-litellm. |
+| `LITELLM_BASE_URL` | Optional, litellm only. Gateway root, with or without `/v1`; ak-jev adds `/typesafe`. |
 | `JEV_LIVE` | `1` un-skips the live suite. |
 | `LOG_LEVEL` | pino level. |
 

@@ -13,7 +13,7 @@
 import { readFileSync } from 'node:fs';
 import BaseJev from './base.js';
 import { noul, choice, score } from './questions.js';
-import { listModels, MODEL_PRICING, MODEL_PRICING_AS_OF, MODEL_LIMITS } from './models.js';
+import { listModels, MODEL_PRICING, MODEL_PRICING_AS_OF, MODEL_LIMITS, PROVIDERS } from './models.js';
 import { estimate as estimateRequestCost } from './index.js';
 import { JevError } from './errors.js';
 
@@ -41,11 +41,14 @@ QUESTIONS
   A --noul with no "id:" prefix is named n1, n2, ... in order.
 
 OPTIONS
-  --model <name>              default jev-latest
-  --api-key <key>             overrides TYPESAFE_API_KEY. That variable is read
-                              from the environment, or from a .env file in the
-                              CURRENT directory. Prefer the variable: an argument
-                              is visible in "ps" and in your shell history.
+  --provider <name>           typesafe (default) or litellm, Mixpanel's gateway.
+                              Also read from JEV_PROVIDER.
+  --model <name>              default jev-latest on typesafe, kev-latest on litellm
+  --api-key <key>             overrides TYPESAFE_API_KEY, or LITELLM_API_KEY on
+                              litellm. That variable is read from the environment,
+                              or from a .env file in the CURRENT directory. Prefer
+                              the variable: an argument is visible in "ps" and in
+                              your shell history.
   --json                      print the raw JSON result
   --no-cache                  skip the response cache
   --quiet                     suppress the usage footer
@@ -65,7 +68,7 @@ EXAMPLES
 /** Every flag this CLI knows, so a missing value cannot swallow the next one. */
 const FLAGS = new Set([
 	'-h', '--help', '--json', '--json-state', '--no-cache', '--quiet',
-	'--file', '--questions', '--model', '--api-key', '--noul', '--choice', '--score'
+	'--file', '--questions', '--model', '--provider', '--api-key', '--noul', '--choice', '--score'
 ]);
 
 /**
@@ -95,6 +98,7 @@ function parseArgs(argv) {
 		else if (a === '--file') out.file = value(++i);
 		else if (a === '--questions') out.questionsFile = value(++i);
 		else if (a === '--model') out.model = value(++i);
+		else if (a === '--provider') out.provider = value(++i);
 		else if (a === '--api-key') out.apiKey = value(++i);
 		else if (a === '--noul') out.noul.push(value(++i));
 		else if (a === '--choice') out.choice.push(value(++i));
@@ -208,7 +212,7 @@ async function main() {
 	}
 
 	if (command === 'models') {
-		const models = await listModels({ apiKey: args.apiKey });
+		const models = await listModels({ apiKey: args.apiKey, provider: args.provider });
 		for (const m of models) {
 			console.log(`${m.name.padEnd(14)} ${String(m.release_date).slice(0, 10)}  ${m.description}`);
 		}
@@ -218,7 +222,8 @@ async function main() {
 	if (command === 'limits') {
 		for (const [id, rates] of Object.entries(MODEL_PRICING)) {
 			const lim = MODEL_LIMITS[id];
-			console.log(`${id}   (rates as of ${MODEL_PRICING_AS_OF})`);
+			const only = Object.values(PROVIDERS).find((p) => p.limitsModel === id);
+			console.log(`${id}   (rates as of ${MODEL_PRICING_AS_OF})${only ? `  ${only.name} provider only` : ''}`);
 			console.log(`  input             $${rates.input}/Mtok`);
 			console.log(`  output            $${rates.output}/Mtok  (free)`);
 			console.log(`  context           ${lim.contextTokens} tokens total, ${lim.stateTokens} for state + longest question`);
@@ -242,7 +247,7 @@ async function main() {
 	if (command === 'estimate') {
 		// Deliberately before the client is built: estimating makes no API call, so
 		// it must not require a key.
-		const est = estimateRequestCost(state, questions, { model: args.model });
+		const est = estimateRequestCost(state, questions, { model: args.model, provider: args.provider });
 		if (args.json) return console.log(JSON.stringify(est, null, 2));
 		console.log(`questions        ${est.questionCount}`);
 		console.log(`state tokens     ~${est.stateTokens}`);
@@ -256,6 +261,7 @@ async function main() {
 	}
 
 	const jev = new BaseJev({
+		provider: args.provider,
 		modelName: args.model,
 		apiKey: args.apiKey,
 		cache: !args.noCache,
@@ -276,7 +282,8 @@ async function main() {
 		const cost = u.estimatedCost === null ? 'unknown' : `$${u.estimatedCost.toFixed(8)}`;
 		console.log(
 			`${result.model}  ${result.latencyMs}ms  ${u.inputTokens} in / ${u.outputTokens} out  ${cost}` +
-				`${result.cached ? '  (cached)' : ''}`
+				`${result.cached ? '  (cached)' : ''}` +
+				`${u.keySpend !== undefined ? `  key spend $${u.keySpend}` : ''}`
 		);
 	}
 }

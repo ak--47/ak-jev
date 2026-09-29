@@ -253,8 +253,20 @@ export interface Usage {
 	totalTokens: number;
 	/** USD. `null` means unknown — it never means free. */
 	estimatedCost: number | null;
-	/** This API returns no cost header, so a live call is always `'estimated'`. */
-	costSource: 'estimated' | 'cached';
+	/**
+	 * `'estimated'` from `MODEL_PRICING`; `'gateway'` when the litellm gateway sent
+	 * `x-litellm-response-cost`; `'cached'` for a cache hit. TypeSafe itself sends no
+	 * cost header.
+	 */
+	costSource: 'estimated' | 'cached' | 'gateway';
+	/** `x-litellm-call-id`. litellm provider only. */
+	callId?: string;
+	/**
+	 * `x-litellm-key-spend`: the key's cumulative USD as of the gateway's last
+	 * settle. It lags the call that carries it, so it is never this call's cost.
+	 * litellm provider only.
+	 */
+	keySpend?: number;
 	/** API round trips. 0 for a cache hit. */
 	requests: number;
 	cached: boolean;
@@ -372,6 +384,8 @@ export declare const MODEL_ALIASES: Readonly<Record<string, string>>;
 export declare const MODEL_LIMITS: Readonly<Record<string, ModelLimits>>;
 export declare const DEFAULT_MODEL: string;
 export declare const DEFAULT_BASE_URL: string;
+/** `https://litellm.mixpanel.org`, the root the litellm provider appends `/typesafe` to. */
+export declare const LITELLM_DEFAULT_ROOT: string;
 export declare const SYSTEM_ONE_PATH: string;
 export declare const MODELS_PATH: string;
 
@@ -379,12 +393,54 @@ export declare function resolveModelId(model: string): string;
 export declare function resolvePricing(
 	model: string
 ): (ModelPricing & { asOf: string; modelId: string }) | null;
-export declare function resolveLimits(model: string): ModelLimits;
+/** On a provider with a `limitsModel` (litellm), that model's limits apply to every name. */
+export declare function resolveLimits(
+	model: string,
+	provider?: ProviderName | { limitsModel?: string }
+): ModelLimits;
+
+export type ProviderName = 'typesafe' | 'litellm';
+
+export interface ProviderSpec {
+	name: ProviderName;
+	/** Environment variables read for the key, in order. */
+	keyEnv: readonly string[];
+	keyHelp: string;
+	baseURL(): string;
+	defaultModel(): string;
+	/** The model whose limits apply to every name on this provider. */
+	limitsModel: string | undefined;
+	/** Per-attempt default, ms. `undefined` keeps `DEFAULT_TIMEOUT_MS`. */
+	timeout: number | undefined;
+}
+
+export interface ResolvedProvider {
+	name: ProviderName;
+	baseURL: string;
+	defaultModel: string;
+	/** From the provider's key variables, when set. */
+	apiKey: string | undefined;
+	keyEnv: readonly string[];
+	keyHelp: string;
+	limitsModel: string | undefined;
+	timeout: number | undefined;
+}
+
+/**
+ * `typesafe` is TypeSafe's hosted Jev. `litellm` is Mixpanel's gateway, a
+ * pass-through to a self-hosted Kev (`jaredpalmer/kev-4b`) at
+ * `https://litellm.mixpanel.org/typesafe`.
+ */
+export declare const PROVIDERS: Readonly<Record<ProviderName, ProviderSpec>>;
+export declare const DEFAULT_PROVIDER: ProviderName;
+/** Falls back to `JEV_PROVIDER`, then `typesafe`. Throws on an unknown name. */
+export declare function resolveProvider(name?: string): ResolvedProvider;
 export declare function computeCost(
 	usage: { inputTokens?: number; outputTokens?: number },
 	model: string
 ): number | null;
 export declare function listModels(opts?: {
+	provider?: ProviderName;
 	apiKey?: string;
 	baseURL?: string;
 	fetch?: typeof fetch;
@@ -456,14 +512,26 @@ export interface CacheOptions {
 }
 
 export interface JevOptions {
-	/** Default `jev-latest`. Also accepted as `model`. */
+	/**
+	 * Where requests go. Falls back to `JEV_PROVIDER`, then `typesafe`. `litellm` is
+	 * Mixpanel's gateway, which serves Kev; it reads `LITELLM_API_KEY`.
+	 */
+	provider?: ProviderName;
+	/** Default `jev-latest` on typesafe, `kev-latest` on litellm. Also accepted as `model`. */
 	modelName?: string;
 	model?: string;
-	/** Falls back to `TYPESAFE_API_KEY`, then `JEV_API_KEY`. */
+	/**
+	 * Falls back to `TYPESAFE_API_KEY`, then `JEV_API_KEY` (typesafe), or to
+	 * `LITELLM_API_KEY` (litellm).
+	 */
 	apiKey?: string;
-	/** Falls back to `TYPESAFE_BASE_URL`, then `https://api.typesafe.ai`. */
+	/**
+	 * Falls back to `TYPESAFE_BASE_URL`, then `https://api.typesafe.ai` (typesafe), or
+	 * to `LITELLM_BASE_URL` + `/typesafe`, then `https://litellm.mixpanel.org/typesafe`
+	 * (litellm).
+	 */
 	baseURL?: string;
-	/** Per attempt, ms. Default 30000. */
+	/** Per attempt, ms. Default 30000 on typesafe, 120000 on litellm. */
 	timeout?: number;
 	retry?: Partial<RetryPolicy>;
 	defaultHeaders?: Record<string, string>;
@@ -516,6 +584,7 @@ export declare class BaseJev {
 	constructor(options?: JevOptions);
 
 	modelName: string;
+	provider: ProviderName;
 	baseURL: string;
 	thresholds: Required<Thresholds>;
 	validate: boolean;
@@ -1098,6 +1167,7 @@ export declare const DEFAULT_TIMEOUT_MS: number;
 
 export declare class JevClient {
 	constructor(config?: {
+		provider?: ProviderName;
 		apiKey?: string;
 		baseURL?: string;
 		timeout?: number;
@@ -1107,6 +1177,9 @@ export declare class JevClient {
 		governor?: Governor;
 		userAgent?: string;
 	});
+	provider: ProviderName;
+	/** The variable a 401 message names. */
+	keyEnv: string;
 	apiKey: string;
 	baseURL: string;
 	timeout: number;
@@ -1128,6 +1201,11 @@ export declare class JevClient {
 }
 
 export declare function backoffDelay(err: unknown, attempt: number, retry: RetryPolicy): number;
+
+/** Read the litellm gateway's `x-litellm-*` headers. Every field is absent on typesafe. */
+export declare function gatewayMeta(
+	headers?: Record<string, string>
+): { responseCost?: number; callId?: string; keySpend?: number };
 
 export declare class ResponseCache {
 	constructor(opts?: CacheOptions);
@@ -1223,6 +1301,8 @@ export declare function errorFromResponse(args: {
 	body: unknown;
 	headers: Record<string, string>;
 	requestId: string | undefined;
+	/** The variable a 401 message names. Default `TYPESAFE_API_KEY`. */
+	keyEnv?: string;
 }): JevAPIError;
 export declare function parseRetryAfter(headers?: Record<string, string>): number | undefined;
 
@@ -1251,7 +1331,7 @@ export declare function models(opts?: JevOptions): Promise<ModelCard[]>;
 export declare function estimate(
 	state: EntryType,
 	questions: Questions,
-	opts?: { model?: string }
+	opts?: { model?: string; provider?: ProviderName }
 ): Estimate & { estimatedCost: number | null };
 
 /**
