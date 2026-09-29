@@ -22,10 +22,9 @@ import { fakeFetch, systemOneBody, noulAnswer } from './_harness.js';
 
 const GATEWAY = Object.freeze({ provider: 'litellm', logLevel: 'silent', cache: false });
 
-/** Headers the gateway sent on a live kev-latest call, 2026-09-28. */
+/** Headers the gateway sent on a live kev-latest call, 2026-09-28 (internal host header removed). */
 const LIVE_GATEWAY_HEADERS = {
 	'x-litellm-call-id': 'bfa9faa7-ce54-4caf-b74f-13d70572645e',
-	'x-litellm-model-api-base': 'http://kev.kev.svc.cluster.local:8008/v1/systemone',
 	'x-litellm-key-spend': '7.98e-07'
 };
 

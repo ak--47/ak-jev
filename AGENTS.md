@@ -190,7 +190,7 @@ model list and UI, and it logs as `typesafe/kev-latest`. Measured 2026-09-28;
 
 - **Every model name is served by Kev.** `kev-latest`, `jev-latest`,
   `jev-1.13.0`, `gpt-9` and a missing `model` all return 200 from the same server
-  (response header `x-litellm-model-api-base: http://kev.kev.svc…`). So
+  (the `x-litellm-model-api-base` response header names the same server). So
   `PROVIDERS.litellm.limitsModel` forces Kev's limits for every name, and
   `BaseJev._limitsModel()` passes it to validation and the budget check.
 - **Billing still follows the name.** `kev-latest` is free. `jev-latest` and
